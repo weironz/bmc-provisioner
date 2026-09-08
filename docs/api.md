@@ -9,7 +9,7 @@
 ## 获取 lessor 确认的 BMC
 
 ```text
-GET /api/v1/candidates?lessorUrl=http://127.0.0.1:6767&scopeId=1
+GET /api/v1/candidates?lessorUrl=http://127.0.0.1:8080&scopeId=1
 ```
 
 只返回 lessor 标记为 `kind=bmc` 且 `confidence=confirmed` 的设备。

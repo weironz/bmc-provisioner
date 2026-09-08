@@ -42,7 +42,9 @@
 
   type ApiFailure = { error?: string; details?: { ethernetInterfaceUris?: string[] } };
 
-  let lessorUrl = 'http://127.0.0.1:6767';
+  // lessord's HTTP API defaults to 8080. Port 6767 is its DHCP listener,
+  // which intentionally does not serve the device-discovery API.
+  let lessorUrl = 'http://127.0.0.1:8080';
   let scopeId = 1;
   let candidates: Candidate[] = [];
   let selectedIp = '';

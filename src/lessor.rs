@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn accepts_local_http_for_lessors_desktop_api() {
-        assert!(LessorClient::new(Url::parse("http://127.0.0.1:6767/").unwrap()).is_ok());
+        assert!(LessorClient::new(Url::parse("http://127.0.0.1:8080/").unwrap()).is_ok());
     }
 
     #[test]

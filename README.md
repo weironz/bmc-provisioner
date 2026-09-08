@@ -53,5 +53,5 @@ docker compose up --build
 ```
 
 容器端口只映射到主机 loopback，浏览器访问 `http://127.0.0.1:6770`。若 lessor 仍运行在
-Windows 主机，页面中的 lessor 地址应填写 `http://host.docker.internal:6767`，而不是
+Windows 主机，页面中的 lessor 地址应填写 `http://host.docker.internal:8080`，而不是
 `127.0.0.1`。
