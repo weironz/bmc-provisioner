@@ -5,4 +5,5 @@
 pub mod lessor;
 pub mod model;
 pub mod redfish;
+pub mod storage;
 pub mod workflow;

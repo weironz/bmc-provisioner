@@ -11,6 +11,7 @@ use bmc_provisioner::{
     lessor::LessorClient,
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
     redfish::{CertificateFingerprint, EthernetInterface, RedfishClient, probe_certificate},
+    storage::{InventoryStore, ManagedBmc},
     workflow::ProvisionWorkflow,
 };
 use serde::{Deserialize, Serialize};
@@ -23,11 +24,16 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Default)]
 struct AppState {
-    plans: Mutex<HashMap<Uuid, ProvisionPlan>>,
+    plans: Mutex<HashMap<Uuid, PlannedRecord>>,
     jobs: Mutex<HashMap<Uuid, JobRecord>>,
     active_job: Mutex<bool>,
+    inventory: InventoryStore,
+}
+
+struct PlannedRecord {
+    candidate: BmcCandidate,
+    plan: ProvisionPlan,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +126,13 @@ struct ApplyRequest {
     credentials: Credentials,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedHealthCheckRequest {
+    username: String,
+    current_password: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JobRecord {
@@ -146,7 +159,12 @@ async fn main() {
         )
         .init();
 
-    let state = Arc::new(AppState::default());
+    let state = Arc::new(AppState {
+        plans: Mutex::new(HashMap::new()),
+        jobs: Mutex::new(HashMap::new()),
+        active_job: Mutex::new(false),
+        inventory: InventoryStore::open_default().expect("open local BMC inventory"),
+    });
     let ui_directory =
         std::env::var("BMC_PROVISIONER_UI_DIR").unwrap_or_else(|_| "ui/dist".to_owned());
     let index = format!("{ui_directory}/index.html");
@@ -166,6 +184,11 @@ async fn main() {
         .route("/api/v1/provision/plan", post(plan))
         .route("/api/v1/provision/plans/{plan_id}/apply", post(apply))
         .route("/api/v1/jobs/{job_id}", get(job))
+        .route("/api/v1/managed-bmcs", get(list_managed_bmcs))
+        .route(
+            "/api/v1/managed-bmcs/{identity}/check",
+            post(check_managed_bmc),
+        )
         // The service itself only listens on loopback. This permits the Vite development UI to
         // call it from a different loopback port; the packaged desktop UI will be same-origin.
         .layer(CorsLayer::very_permissive())
@@ -216,11 +239,13 @@ async fn plan(
     .await
     .map_err(workflow_api_error)?;
     let plan_id = Uuid::new_v4();
-    state
-        .plans
-        .lock()
-        .await
-        .insert(plan_id, provision_plan.clone());
+    state.plans.lock().await.insert(
+        plan_id,
+        PlannedRecord {
+            candidate: candidate.clone(),
+            plan: provision_plan.clone(),
+        },
+    );
     Ok(Json(PlannedProvision {
         plan_id,
         candidate,
@@ -329,7 +354,7 @@ async fn apply(
             "another BMC provisioning job is already running",
         ));
     }
-    let plan = state
+    let planned = state
         .plans
         .lock()
         .await
@@ -347,22 +372,51 @@ async fn apply(
     };
     state.jobs.lock().await.insert(job_id, queued.clone());
 
-    tokio::spawn(run_job(state, job_id, plan, request.credentials));
+    tokio::spawn(run_job(
+        state,
+        job_id,
+        planned.candidate,
+        planned.plan,
+        request.credentials,
+    ));
     Ok((StatusCode::ACCEPTED, Json(queued)))
 }
 
 async fn run_job(
     state: Arc<AppState>,
     job_id: Uuid,
+    candidate: BmcCandidate,
     plan: ProvisionPlan,
     credentials: Credentials,
 ) {
     update_job(&state, job_id, JobState::Running, None, None).await;
+    let target_network = plan.target_network.clone();
+    let fingerprint = plan.certificate_fingerprint.clone();
     match ProvisionWorkflow::apply(plan, credentials).await {
-        Ok(result) => update_job(&state, job_id, JobState::Completed, Some(result), None).await,
+        Ok(result) => {
+            if let Err(error) = state.inventory.record_provision(
+                &candidate,
+                &target_network,
+                fingerprint.as_deref(),
+                Some(&result),
+                None,
+            ) {
+                tracing::error!(error = %error, job_id = %job_id, "could not persist configured BMC inventory");
+            }
+            update_job(&state, job_id, JobState::Completed, Some(result), None).await;
+        }
         Err(error) => {
             // Do not persist raw BMC response bodies or credentials in a job record.
             tracing::warn!(error = %error, job_id = %job_id, "BMC provisioning job failed");
+            if let Err(store_error) = state.inventory.record_provision(
+                &candidate,
+                &target_network,
+                fingerprint.as_deref(),
+                None,
+                Some("BMC rejected or did not support one of the requested changes"),
+            ) {
+                tracing::error!(error = %store_error, job_id = %job_id, "could not persist failed BMC inventory");
+            }
             update_job(
                 &state,
                 job_id,
@@ -404,6 +458,70 @@ async fn job(
     Ok(Json(record))
 }
 
+async fn list_managed_bmcs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ManagedBmc>>, ApiError> {
+    state.inventory.list().map(Json).map_err(|error| {
+        tracing::error!(error = %error, "could not read local BMC inventory");
+        ApiError::internal("could not read local BMC inventory")
+    })
+}
+
+/// Checks a persisted BMC without retaining the supplied credential. A TLS handshake establishes
+/// reachability first; authenticated Redfish discovery then distinguishes usable credentials.
+async fn check_managed_bmc(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+    Json(request): Json<ManagedHealthCheckRequest>,
+) -> Result<Json<ManagedBmc>, ApiError> {
+    let managed = state
+        .inventory
+        .find(&identity)
+        .map_err(inventory_api_error)?
+        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    if probe_certificate(managed.current_ip).await.is_err() {
+        return state
+            .inventory
+            .record_health(
+                &identity,
+                "offline",
+                "unreachable",
+                "unknown",
+                Some("HTTPS connection failed"),
+            )
+            .map(Json)
+            .map_err(inventory_api_error);
+    }
+    let credentials = Credentials {
+        username: request.username,
+        current_password: request.current_password,
+        new_password: String::new(),
+    };
+    let client = RedfishClient::for_ipv4_with_fingerprint(
+        managed.current_ip,
+        &credentials,
+        managed.certificate_fingerprint.as_deref(),
+    )
+    .map_err(workflow_redfish_api_error)?;
+    let health = match client.discover().await {
+        Ok(_) => ("online", "reachable", "success", None),
+        Err(error) => {
+            tracing::warn!(error = %error, ip = %managed.current_ip, "managed BMC health check could not authenticate");
+            (
+                "online",
+                "reachable",
+                "failed",
+                Some("Redfish authentication or discovery failed"),
+            )
+        }
+    };
+    state
+        .inventory
+        .record_health(&identity, health.0, health.1, health.2, health.3)
+        .map(Json)
+        .map_err(inventory_api_error)
+}
+
 fn lessor_client(lessor_url: &str) -> Result<LessorClient, ApiError> {
     let url = Url::parse(lessor_url)
         .map_err(|_| ApiError::bad_request("lessorUrl must be a valid URL"))?;
@@ -425,6 +543,11 @@ fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiErr
 fn workflow_redfish_api_error(error: bmc_provisioner::redfish::RedfishError) -> ApiError {
     tracing::warn!(error = %error, "could not complete read-only Redfish diagnostic");
     ApiError::unprocessable("BMC could not complete the requested read-only Redfish diagnostic")
+}
+
+fn inventory_api_error(error: bmc_provisioner::storage::StoreError) -> ApiError {
+    tracing::error!(error = %error, "local BMC inventory operation failed");
+    ApiError::internal("could not update local BMC inventory")
 }
 
 struct ApiError {
@@ -477,6 +600,14 @@ impl ApiError {
     fn bad_gateway(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
+            message,
+            details: None,
+        }
+    }
+
+    fn internal(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
             details: None,
         }

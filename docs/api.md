@@ -48,6 +48,18 @@ GET  /api/v1/jobs/{jobId}
 202 与 job。网络写入后最多以 5 秒间隔重连 12 次；连接尚未恢复时结果是
 `network_changed_unverified`，不视为完成。
 
+## 本机 BMC 清单与状态检查
+
+```text
+GET  /api/v1/managed-bmcs
+POST /api/v1/managed-bmcs/{identity}/check
+```
+
+配置任务结束时会把 MAC（或没有 MAC 时的作用域/IP 标识）、源/目标地址、证书指纹与结果写入
+本机 SQLite。`check` 请求只接受本次的 `username` 与 `currentPassword`：先做 TLS 连通性检查，
+再做已认证的 Redfish 发现，返回并持久化 `onlineStatus`、`redfishStatus` 与
+`authenticationStatus`。凭据永不写入清单。
+
 ## 已知静态 BMC 的只读诊断
 
 ```text

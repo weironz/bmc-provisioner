@@ -29,10 +29,14 @@ section { background: #fff; border: 1px solid #dbe5de; border-radius: 14px; box-
 label { color: #456157; display: grid; font-size: .84rem; font-weight: 650; gap: 7px; }
 input, select { width: 100%; border: 1px solid #b9cfc3; border-radius: 7px; background: #fff; color: #17221e; padding: 9px 10px; }
 input:focus, select:focus { border-color: #0f766e; box-shadow: 0 0 0 3px #bde5d8; outline: none; }
-.candidate-list { display: grid; gap: 9px; }
-.candidate { display: grid; grid-template-columns: 160px 1fr; align-items: center; text-align: left; border: 1px solid #d8e4dc; border-radius: 8px; background: #fbfdfb; color: #1c3128; padding: 13px; }
+.candidate-list { display: grid; gap: 7px; overflow-x: auto; }
+.candidate { align-items: center; display: grid; grid-template-columns: minmax(190px, 1.25fr) minmax(150px, 1fr) minmax(180px, 1fr) auto; gap: 12px; min-width: 760px; text-align: left; border: 1px solid #d8e4dc; border-radius: 8px; background: #fbfdfb; color: #1c3128; padding: 11px 13px; }
 .candidate:hover, .candidate.selected { border-color: #0f766e; background: #e5f5ef; }
 .candidate span { color: #5f746a; font-size: .88rem; }
+.candidate span strong, .candidate span small { display: block; }
+.candidate small, .inventory-row small { color: #5f746a; font-size: .78rem; margin-top: 3px; }
+.candidate button, .inventory-row button { border: 1px solid #0f766e; border-radius: 7px; background: #fff; color: #0f766e; font-weight: 700; padding: 8px 10px; white-space: nowrap; }
+.candidate.header-row, .inventory-row.table-heading { border: 0; background: transparent; color: #6d8177; font-size: .78rem; font-weight: 750; padding: 3px 8px; }
 .static-diagnostic { border-top: 1px solid #dfe9e2; margin-top: 20px; padding-top: 20px; }
 .static-diagnostic h3 { font-size: 1rem; margin: 3px 0; }
 .static-diagnostic > div > p:last-child { color: #5f746a; font-size: .86rem; line-height: 1.45; }
@@ -55,13 +59,23 @@ dd { margin: 4px 0 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono
 footer { color: #47665a; line-height: 1.55; margin: 22px 2px; }
 .error { color: #a22e22; font-weight: 700; }
 .job { color: #6e7e77; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .8rem; }
+.inventory-note { margin: -6px 0 16px; }
+.inventory-table { display: grid; gap: 7px; overflow-x: auto; }
+.inventory-row { align-items: center; display: grid; grid-template-columns: minmax(190px, 1.15fr) minmax(170px, 1fr) 90px minmax(180px, 1.3fr) minmax(145px, 1fr) auto; gap: 12px; min-width: 940px; border: 1px solid #d8e4dc; border-radius: 8px; background: #fbfdfb; padding: 11px 13px; font-size: .84rem; }
+.inventory-row strong, .inventory-row small { display: block; }
+.inventory-row a { color: #0f766e; overflow-wrap: anywhere; }
+.inventory-row i { color: #a33a26; font-style: normal; font-weight: 700; }
+.inventory-row i.online { color: #19764a; }
+.warning { color: #a35c17; font-weight: 700; }
 
 @media (max-width: 680px) {
   main { width: min(100% - 20px, 980px); padding-top: 24px; }
   section { padding: 18px; }
   .fields, .fields.compact, .plan { grid-template-columns: 1fr; }
   .static-controls { align-items: stretch; grid-template-columns: 1fr; }
-  .candidate { grid-template-columns: 1fr; gap: 4px; }
+  .candidate { grid-template-columns: 1fr; gap: 4px; min-width: 0; }
+  .candidate.header-row, .inventory-row.table-heading { display: none; }
+  .inventory-row { grid-template-columns: 1fr; gap: 5px; min-width: 0; }
   .section-title { align-items: flex-start; flex-direction: column; }
   .certificate { align-items: flex-start; flex-direction: column; }
 }

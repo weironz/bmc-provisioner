@@ -29,6 +29,10 @@ cargo run --bin bmc-provisionerd
 
 服务默认只监听 `http://127.0.0.1:6770`；例如 `GET /healthz` 返回 `204`。
 
+每次配置完成或失败后，BMC 的 MAC、源/目标地址、证书指纹、配置结果和最后检查状态会
+保存在本机 SQLite 清单中（Windows 默认位于 `%LOCALAPPDATA%\\bmc-provisioner\\inventory.sqlite3`）。
+密码不会写入该数据库；清单页的认证检查只使用当次输入的凭据。
+
 另开一个终端可启动开发界面：
 
 ```powershell

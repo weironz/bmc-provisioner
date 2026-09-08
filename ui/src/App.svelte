@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   // Vite and Tauri use a separate UI origin during development / desktop execution. Docker serves
   // this page from bmc-provisionerd itself, so same-origin keeps the browser-side API local.
@@ -40,6 +40,23 @@
     ethernetInterfaces: Array<{ uri: string; id: string; name?: string }>;
   };
 
+  type ManagedBmc = {
+    identity: string;
+    mac?: string;
+    scopeId: number;
+    scopeName: string;
+    sourceIp: string;
+    currentIp: string;
+    targetNetwork: { address: string; prefix: number; gateway: string };
+    configurationStatus: string;
+    onlineStatus: string;
+    redfishStatus: string;
+    authenticationStatus: string;
+    lastCheckedAt?: number;
+    lastConfiguredAt?: number;
+    lastError?: string;
+  };
+
   type ApiFailure = { error?: string; details?: { ethernetInterfaceUris?: string[] } };
 
   // lessord's HTTP API defaults to 8080. Port 6767 is its DHCP listener,
@@ -47,6 +64,8 @@
   let lessorUrl = 'http://127.0.0.1:8080';
   let scopeId = 1;
   let candidates: Candidate[] = [];
+  let candidateTargets: Record<string, string> = {};
+  let managedBmcs: ManagedBmc[] = [];
   let selectedIp = '';
   let knownStaticIp = '';
   let username = 'admin';
@@ -71,11 +90,15 @@
   let planning = false;
   let applying = false;
   let diagnosingStatic = false;
+  let loadingManaged = false;
+  let checkingManagedIdentity = '';
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
   onDestroy(() => {
     if (pollTimer) clearTimeout(pollTimer);
   });
+
+  onMount(() => { void loadManagedBmcs(); });
 
   function clearPlan() {
     plan = undefined;
@@ -87,9 +110,15 @@
     selectedIp = candidate.ip;
     certificateFingerprint = '';
     certificateConfirmed = false;
+    targetAddress = candidateTargets[candidate.ip] ?? targetAddress;
     clearPlan();
     error = '';
     message = `已选择 ${candidate.ip}${candidate.mac ? `（${candidate.mac}）` : ''}`;
+  }
+
+  function setCandidateTarget(candidate: Candidate, target: string) {
+    candidateTargets = { ...candidateTargets, [candidate.ip]: target };
+    if (selectedIp === candidate.ip) targetAddress = target;
   }
 
   async function readFailure(response: Response): Promise<ApiFailure> {
@@ -113,6 +142,10 @@
         throw new Error(failure.error ?? '无法读取 lessor BMC 列表');
       }
       candidates = (await response.json()) as Candidate[];
+      candidateTargets = candidates.reduce<Record<string, string>>(
+        (targets, candidate) => ({ ...targets, [candidate.ip]: candidateTargets[candidate.ip] ?? '' }),
+        {}
+      );
       if (candidates.length === 0) {
         message = '当前作用域没有 lessor 已确认的 BMC；请检查 DHCP 租约和 IPMI 识别。';
       } else {
@@ -123,6 +156,57 @@
     } finally {
       loadingCandidates = false;
     }
+  }
+
+  async function loadManagedBmcs() {
+    loadingManaged = true;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/managed-bmcs`);
+      if (!response.ok) {
+        const failure = await readFailure(response);
+        throw new Error(failure.error ?? '无法读取本机 BMC 清单');
+      }
+      managedBmcs = (await response.json()) as ManagedBmc[];
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '读取本机 BMC 清单失败';
+    } finally {
+      loadingManaged = false;
+    }
+  }
+
+  async function checkManagedBmc(bmc: ManagedBmc) {
+    if (!username || !currentPassword) {
+      error = '检查认证状态需要输入当前用户名和密码；凭据不会保存。';
+      return;
+    }
+    checkingManagedIdentity = bmc.identity;
+    error = '';
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/managed-bmcs/${encodeURIComponent(bmc.identity)}/check`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username, currentPassword })
+      });
+      if (!response.ok) {
+        const failure = await readFailure(response);
+        throw new Error(failure.error ?? 'BMC 状态检查失败');
+      }
+      const updated = (await response.json()) as ManagedBmc;
+      managedBmcs = managedBmcs.map((item) => item.identity === updated.identity ? updated : item);
+      message = `${updated.currentIp} 已完成状态检查；密码未保存。`;
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : 'BMC 状态检查失败';
+    } finally {
+      checkingManagedIdentity = '';
+    }
+  }
+
+  function stateLabel(value: string) {
+    return ({ online: '在线', offline: '离线', reachable: '可用', unreachable: '不可达', success: '成功', failed: '失败', unknown: '未检查', completed: '已完成', network_changed_unverified: '待复查' } as Record<string, string>)[value] ?? value;
+  }
+
+  function formatTime(seconds?: number) {
+    return seconds ? new Date(seconds * 1000).toLocaleString() : '未检查';
   }
 
   async function createPlan() {
@@ -323,11 +407,14 @@
     </div>
     {#if candidates.length > 0}
       <div class="candidate-list" aria-label="已确认 BMC">
+        <div class="candidate header-row"><span>作用域 / 当前地址</span><span>MAC</span><span>目标静态 IP（草稿）</span><span></span></div>
         {#each candidates as candidate}
-          <button class:selected={selectedIp === candidate.ip} class="candidate" onclick={() => choose(candidate)}>
-            <strong>{candidate.ip}</strong>
-            <span>{candidate.mac ?? 'MAC 未返回'} · {candidate.scopeName} / {candidate.subnet}/{candidate.prefix}</span>
-          </button>
+          <div class:selected={selectedIp === candidate.ip} class="candidate">
+            <span><strong>{candidate.ip}</strong><small>{candidate.scopeName} / {candidate.subnet}/{candidate.prefix}</small></span>
+            <code>{candidate.mac ?? 'MAC 未返回'}</code>
+            <input value={candidateTargets[candidate.ip] ?? ''} oninput={(event) => setCandidateTarget(candidate, event.currentTarget.value)} inputmode="decimal" placeholder="例如 10.10.20.101" />
+            <button onclick={() => choose(candidate)}>{selectedIp === candidate.ip ? '已选择' : '配置此台'}</button>
+          </div>
         {/each}
       </div>
     {/if}
@@ -422,6 +509,34 @@
       </button>
     {:else}
       <p class="muted">生成计划后才会显示即将修改的 Redfish 资源。</p>
+    {/if}
+  </section>
+
+  <section aria-labelledby="managed-heading">
+    <div class="section-title">
+      <div>
+        <p class="step">04</p>
+        <h2 id="managed-heading">BMC 清单与访问状态</h2>
+      </div>
+      <button onclick={loadManagedBmcs} disabled={loadingManaged}>{loadingManaged ? '正在刷新…' : '刷新清单'}</button>
+    </div>
+    <p class="muted inventory-note">清单保存在本机 SQLite，只记录 MAC、地址、配置结果和状态，不保存密码。认证检查使用上方当前凭据。</p>
+    {#if managedBmcs.length > 0}
+      <div class="inventory-table" aria-label="已配置 BMC 清单">
+        <div class="inventory-row table-heading"><span>BMC / MAC</span><span>访问地址</span><span>配置</span><span>在线 / Redfish / 认证</span><span>最后检查</span><span></span></div>
+        {#each managedBmcs as bmc}
+          <div class="inventory-row">
+            <span><strong>{bmc.currentIp}</strong><small>{bmc.mac ?? bmc.identity} · {bmc.scopeName}</small></span>
+            <a href={`https://${bmc.currentIp}`} target="_blank" rel="noreferrer">https://{bmc.currentIp}</a>
+            <span class:warning={bmc.configurationStatus !== 'completed'}>{stateLabel(bmc.configurationStatus)}</span>
+            <span><i class:online={bmc.onlineStatus === 'online'}>{stateLabel(bmc.onlineStatus)}</i> / {stateLabel(bmc.redfishStatus)} / {stateLabel(bmc.authenticationStatus)}</span>
+            <span>{formatTime(bmc.lastCheckedAt)}</span>
+            <button onclick={() => checkManagedBmc(bmc)} disabled={checkingManagedIdentity === bmc.identity}>{checkingManagedIdentity === bmc.identity ? '检查中…' : '检查'}</button>
+          </div>
+        {/each}
+      </div>
+    {:else}
+      <p class="muted">配置过的 BMC 会自动进入这里；也会保留“网络已变更、待复查”与失败记录，方便后续单独检查。</p>
     {/if}
   </section>
 
