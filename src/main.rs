@@ -14,6 +14,7 @@ use bmc_provisioner::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
@@ -92,6 +93,9 @@ async fn main() {
         .route("/api/v1/provision/plan", post(plan))
         .route("/api/v1/provision/plans/{plan_id}/apply", post(apply))
         .route("/api/v1/jobs/{job_id}", get(job))
+        // The service itself only listens on loopback. This permits the Vite development UI to
+        // call it from a different loopback port; the packaged desktop UI will be same-origin.
+        .layer(CorsLayer::very_permissive())
         .with_state(state);
     let address: SocketAddr = "127.0.0.1:6770"
         .parse()
@@ -253,6 +257,13 @@ fn lessor_client(lessor_url: &str) -> Result<LessorClient, ApiError> {
 }
 
 fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiError {
+    if let bmc_provisioner::workflow::WorkflowError::InterfaceSelectionRequired(interfaces) = error
+    {
+        return ApiError::unprocessable_with_details(
+            "multiple BMC Ethernet interfaces were found; select one before applying",
+            serde_json::json!({ "ethernetInterfaceUris": interfaces }),
+        );
+    }
     tracing::warn!(error = %error, "could not build BMC provisioning plan");
     ApiError::unprocessable("BMC could not produce a supported provisioning plan")
 }
@@ -260,6 +271,7 @@ fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiErr
 struct ApiError {
     status: StatusCode,
     message: &'static str,
+    details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -267,6 +279,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message,
+            details: None,
         }
     }
 
@@ -274,6 +287,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message,
+            details: None,
         }
     }
 
@@ -281,6 +295,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message,
+            details: None,
         }
     }
 
@@ -288,6 +303,15 @@ impl ApiError {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message,
+            details: None,
+        }
+    }
+
+    fn unprocessable_with_details(message: &'static str, details: serde_json::Value) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+            details: Some(details),
         }
     }
 
@@ -295,16 +319,17 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message,
+            details: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
+        let mut body = serde_json::json!({ "error": self.message });
+        if let Some(details) = self.details {
+            body["details"] = details;
+        }
+        (self.status, Json(body)).into_response()
     }
 }

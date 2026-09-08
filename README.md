@@ -28,3 +28,14 @@ cargo run --bin bmc-provisionerd
 ```
 
 服务默认只监听 `http://127.0.0.1:6770`；例如 `GET /healthz` 返回 `204`。
+
+另开一个终端可启动开发界面：
+
+```powershell
+cd ui
+bun install
+bun run dev
+```
+
+然后访问 Vite 输出的本机地址（默认 `http://127.0.0.1:5173`）。先启动
+`bmc-provisionerd`，页面才能访问 `127.0.0.1:6770` 的本地 API。

@@ -16,8 +16,8 @@
 
 ## Phase 2 — 本地操作界面
 
-- [ ] 建立 plan/apply 页面与安全密码输入。
-- [ ] 显示当前 IP、目标 IP、步骤日志和可恢复错误。
+- [x] 建立 Svelte plan/apply 页面与安全密码输入。
+- [x] 显示当前 IP、目标 IP、任务状态和可恢复错误。
 - [ ] 添加 Tauri Desktop sidecar，并实现 `just app`。
 
 ## Phase 3 — 可部署交付
