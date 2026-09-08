@@ -2,7 +2,7 @@ set shell := ["powershell", "-NoProfile", "-Command"]
 
 # Build the service sidecar, stop an existing development desktop shell, then launch Tauri.
 app:
-    $desktop = Get-Process -Name bmc-provisioner -ErrorAction SilentlyContinue; if ($desktop) { $desktop | Stop-Process -Force }
+    $desktop = Get-Process -Name bmc-provisioner,bmc-provisioner-desktop -ErrorAction SilentlyContinue; if ($desktop) { $desktop | Stop-Process -Force }
     cargo build
     New-Item -ItemType Directory -Force ui/src-tauri/binaries | Out-Null
     Copy-Item target/debug/bmc-provisionerd.exe ui/src-tauri/binaries/bmc-provisionerd-x86_64-pc-windows-msvc.exe -Force
