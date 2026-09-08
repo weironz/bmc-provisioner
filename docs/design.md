@@ -64,11 +64,13 @@ bmc-provisionerd (Axum)
 ```text
 GET  /api/v1/candidates?lessorUrl=...&scopeId=...
 POST /api/v1/provision/plan
-POST /api/v1/provision/apply
+POST /api/v1/provision/plans/{plan_id}/apply
 GET  /api/v1/jobs/{id}
 ```
 
-`apply` 返回 job id。单 BMC 同时只允许一个进行中的 job。
+`plan` 先通过 lessor 再次确认用户选中的 IP 仍是本作用域的 confirmed BMC，再访问
+Redfish；生成的 plan 仅保存在内存，不含密码。`apply` 以 `plan_id` 和一次性重传的
+账号密码发起任务并返回 job id。单 BMC 同时只允许一个进行中的 job。
 
 ## Redfish 兼容策略
 

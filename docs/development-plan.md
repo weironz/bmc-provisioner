@@ -4,14 +4,14 @@
 
 - [x] 新建独立 Git 仓库。
 - [x] 固化单机单 BMC MVP 边界与安全模型。
-- [ ] 初始化 Rust workspace、服务 API、Web UI 与本地开发命令。
+- [x] 初始化 Rust 服务核心与本地 HTTP API 基线；Web UI 与本地开发命令待 Phase 2。
 
 ## Phase 1 — 可测试的核心闭环
 
-- [ ] 实现 lessor candidate client 与响应校验。
-- [ ] 实现 Redfish Service Root、会话、账户与 EthernetInterface 资源发现。
-- [ ] 实现 password change 的 Action/PATCH 回退与重新认证。
-- [ ] 实现静态 IPv4/DHCP 配置和新 IP 验证状态机。
+- [x] 实现 lessor candidate client 与响应校验。
+- [x] 实现 Redfish Service Root、账户与 EthernetInterface 资源发现（当前 Basic Auth）。
+- [x] 实现 password change 的 Action/PATCH 回退与重新认证。
+- [x] 实现静态 IPv4/DHCP 配置和新 IP 有限重连验证。
 - [ ] 用 mock Redfish + mock lessor 覆盖正常与失败分支。
 
 ## Phase 2 — 本地操作界面

@@ -1,0 +1,377 @@
+use std::net::Ipv4Addr;
+
+use reqwest::{Response, StatusCode, Url};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use thiserror::Error;
+
+use crate::model::{Credentials, StaticNetwork};
+
+/// Standard Redfish resources discovered dynamically from the Service Root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedfishInventory {
+    pub account: AccountResource,
+    pub ethernet_interfaces: Vec<EthernetInterface>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountResource {
+    pub uri: String,
+    pub password_change_required: bool,
+    pub change_password_action: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EthernetInterface {
+    pub uri: String,
+    pub id: String,
+    pub name: Option<String>,
+}
+
+/// Redfish client using HTTP Basic authentication. Certificate validation remains enabled.
+#[derive(Clone)]
+pub struct RedfishClient {
+    base_url: Url,
+    client: reqwest::Client,
+    username: String,
+    password: String,
+}
+
+impl RedfishClient {
+    pub fn for_ipv4(ip: Ipv4Addr, credentials: &Credentials) -> Result<Self, RedfishError> {
+        let base_url = Url::parse(&format!("https://{ip}/")).map_err(RedfishError::InvalidUrl)?;
+        Self::new(base_url, credentials)
+    }
+
+    pub fn new(base_url: Url, credentials: &Credentials) -> Result<Self, RedfishError> {
+        if base_url.scheme() != "https" {
+            return Err(RedfishError::HttpsRequired);
+        }
+        if base_url.host_str().is_none() {
+            return Err(RedfishError::MissingHost);
+        }
+        Ok(Self {
+            base_url,
+            client: reqwest::Client::new(),
+            username: credentials.username.clone(),
+            password: credentials.current_password.clone(),
+        })
+    }
+
+    /// Recreate authentication after an account password has changed.
+    pub fn with_password(&self, password: String) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            client: self.client.clone(),
+            username: self.username.clone(),
+            password,
+        }
+    }
+
+    /// Move an already authenticated client to the BMC's configured IPv4 address.
+    /// The caller uses this only after changing the BMC network configuration.
+    pub fn at_ipv4(&self, ip: Ipv4Addr) -> Result<Self, RedfishError> {
+        let base_url = Url::parse(&format!("https://{ip}/")).map_err(RedfishError::InvalidUrl)?;
+        Ok(Self {
+            base_url,
+            client: self.client.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+        })
+    }
+
+    pub async fn discover(&self) -> Result<RedfishInventory, RedfishError> {
+        let root: ServiceRoot = self.get_json("/redfish/v1/").await?;
+        let account_service: AccountService = self.get_json(&root.account_service.odata_id).await?;
+        let account_collection: Collection =
+            self.get_json(&account_service.accounts.odata_id).await?;
+
+        let mut matched_account = None;
+        for member in account_collection.members {
+            let account: ManagerAccount = self.get_json(&member.odata_id).await?;
+            if account.user_name.as_deref() == Some(self.username.as_str()) {
+                matched_account = Some(AccountResource {
+                    uri: member.odata_id,
+                    password_change_required: account.password_change_required.unwrap_or(false),
+                    change_password_action: account.change_password_action(),
+                });
+                break;
+            }
+        }
+        let account =
+            matched_account.ok_or_else(|| RedfishError::AccountNotFound(self.username.clone()))?;
+
+        let managers: Collection = self.get_json(&root.managers.odata_id).await?;
+        let manager = managers
+            .members
+            .into_iter()
+            .next()
+            .ok_or(RedfishError::NoManager)?;
+        let manager: Manager = self.get_json(&manager.odata_id).await?;
+        let interface_collection = manager
+            .ethernet_interfaces
+            .ok_or(RedfishError::NoEthernetInterfaces)?;
+        let interfaces: Collection = self.get_json(&interface_collection.odata_id).await?;
+        let mut ethernet_interfaces = Vec::with_capacity(interfaces.members.len());
+        for member in interfaces.members {
+            let interface: EthernetInterfaceResponse = self.get_json(&member.odata_id).await?;
+            ethernet_interfaces.push(EthernetInterface {
+                uri: member.odata_id,
+                id: interface.id.unwrap_or_default(),
+                name: interface.name,
+            });
+        }
+        if ethernet_interfaces.is_empty() {
+            return Err(RedfishError::NoEthernetInterfaces);
+        }
+
+        Ok(RedfishInventory {
+            account,
+            ethernet_interfaces,
+        })
+    }
+
+    pub async fn change_password(
+        &self,
+        account: &AccountResource,
+        new_password: &str,
+    ) -> Result<(), RedfishError> {
+        if account.password_change_required
+            && let Some(action) = &account.change_password_action
+        {
+            self.send_json(
+                reqwest::Method::POST,
+                action,
+                json!({
+                    "Password": new_password,
+                    "SessionAccountPassword": self.password,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        self.send_json(
+            reqwest::Method::PATCH,
+            &account.uri,
+            json!({ "Password": new_password }),
+        )
+        .await
+    }
+
+    pub async fn configure_static_ipv4(
+        &self,
+        interface_uri: &str,
+        network: &StaticNetwork,
+    ) -> Result<(), RedfishError> {
+        network.validate().map_err(RedfishError::InvalidNetwork)?;
+        self.send_json(
+            reqwest::Method::PATCH,
+            interface_uri,
+            json!({
+                "DHCPv4": { "DHCPEnabled": false },
+                "IPv4StaticAddresses": [{
+                    "Address": network.address.to_string(),
+                    "SubnetMask": network.subnet_mask_string(),
+                    "Gateway": network.gateway.to_string(),
+                }],
+            }),
+        )
+        .await
+    }
+
+    /// A short authenticated request used after the network address has changed.
+    pub async fn verify_connection(&self) -> Result<(), RedfishError> {
+        let _: ServiceRoot = self.get_json("/redfish/v1/").await?;
+        Ok(())
+    }
+
+    async fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        resource: &str,
+    ) -> Result<T, RedfishError> {
+        let url = self.resource_url(resource)?;
+        let response = self
+            .client
+            .get(url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(RedfishError::Request)?;
+        let response = ensure_success(response).await?;
+        response.json().await.map_err(RedfishError::Decode)
+    }
+
+    async fn send_json(
+        &self,
+        method: reqwest::Method,
+        resource: &str,
+        body: Value,
+    ) -> Result<(), RedfishError> {
+        let url = self.resource_url(resource)?;
+        let response = self
+            .client
+            .request(method, url)
+            .basic_auth(&self.username, Some(&self.password))
+            .json(&body)
+            .send()
+            .await
+            .map_err(RedfishError::Request)?;
+        ensure_success(response).await.map(|_| ())
+    }
+
+    /// Restricts BMC-supplied `@odata.id` links to this BMC's HTTPS origin.
+    fn resource_url(&self, resource: &str) -> Result<Url, RedfishError> {
+        let url = self
+            .base_url
+            .join(resource)
+            .map_err(RedfishError::InvalidUrl)?;
+        if url.scheme() != self.base_url.scheme()
+            || url.host_str() != self.base_url.host_str()
+            || url.port_or_known_default() != self.base_url.port_or_known_default()
+        {
+            return Err(RedfishError::CrossOriginLink);
+        }
+        Ok(url)
+    }
+}
+
+async fn ensure_success(response: Response) -> Result<Response, RedfishError> {
+    let status = response.status();
+    if status.is_success() {
+        Ok(response)
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        Err(RedfishError::AuthenticationFailed)
+    } else {
+        Err(RedfishError::UnexpectedStatus(status))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RedfishError {
+    #[error("invalid Redfish URL")]
+    InvalidUrl(#[source] url::ParseError),
+    #[error("Redfish connections must use HTTPS")]
+    HttpsRequired,
+    #[error("Redfish URL is missing a host")]
+    MissingHost,
+    #[error("Redfish returned a link outside the selected BMC")]
+    CrossOriginLink,
+    #[error("could not reach the BMC Redfish service")]
+    Request(#[source] reqwest::Error),
+    #[error("BMC authentication failed")]
+    AuthenticationFailed,
+    #[error("Redfish returned HTTP {0}")]
+    UnexpectedStatus(StatusCode),
+    #[error("Redfish returned an unexpected response")]
+    Decode(#[source] reqwest::Error),
+    #[error("the Redfish account for {0:?} was not found")]
+    AccountNotFound(String),
+    #[error("Redfish did not expose a Manager resource")]
+    NoManager,
+    #[error("Redfish did not expose a Manager EthernetInterface resource")]
+    NoEthernetInterfaces,
+    #[error(transparent)]
+    InvalidNetwork(#[from] crate::model::NetworkValidationError),
+}
+
+#[derive(Deserialize)]
+struct Link {
+    #[serde(rename = "@odata.id")]
+    odata_id: String,
+}
+
+#[derive(Deserialize)]
+struct ServiceRoot {
+    #[serde(rename = "AccountService")]
+    account_service: Link,
+    #[serde(rename = "Managers")]
+    managers: Link,
+}
+
+#[derive(Deserialize)]
+struct AccountService {
+    #[serde(rename = "Accounts")]
+    accounts: Link,
+}
+
+#[derive(Deserialize)]
+struct Collection {
+    #[serde(rename = "Members")]
+    members: Vec<Link>,
+}
+
+#[derive(Deserialize)]
+struct Manager {
+    #[serde(rename = "EthernetInterfaces")]
+    ethernet_interfaces: Option<Link>,
+}
+
+#[derive(Deserialize)]
+struct ManagerAccount {
+    #[serde(rename = "UserName")]
+    user_name: Option<String>,
+    #[serde(rename = "PasswordChangeRequired")]
+    password_change_required: Option<bool>,
+    #[serde(rename = "Actions", default)]
+    actions: Value,
+}
+
+impl ManagerAccount {
+    fn change_password_action(&self) -> Option<String> {
+        self.actions
+            .get("#ManagerAccount.ChangePassword")?
+            .get("target")?
+            .as_str()
+            .map(ToOwned::to_owned)
+    }
+}
+
+#[derive(Deserialize)]
+struct EthernetInterfaceResponse {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credentials() -> Credentials {
+        Credentials {
+            username: "admin".to_owned(),
+            current_password: "not-in-output".to_owned(),
+            new_password: "another-secret".to_owned(),
+        }
+    }
+
+    #[test]
+    fn keeps_odata_links_on_the_selected_bmc() {
+        let client =
+            RedfishClient::new(Url::parse("https://192.168.1.2/").unwrap(), &credentials())
+                .unwrap();
+        assert_eq!(
+            client
+                .resource_url("/redfish/v1/Managers/BMC")
+                .unwrap()
+                .as_str(),
+            "https://192.168.1.2/redfish/v1/Managers/BMC"
+        );
+        assert!(matches!(
+            client.resource_url("https://example.invalid/redfish/v1/"),
+            Err(RedfishError::CrossOriginLink)
+        ));
+    }
+
+    #[test]
+    fn refuses_plain_http_for_bmc_credentials() {
+        let error =
+            match RedfishClient::new(Url::parse("http://192.168.1.2/").unwrap(), &credentials()) {
+                Ok(_) => panic!("plain HTTP must not be accepted"),
+                Err(error) => error,
+            };
+        assert!(matches!(error, RedfishError::HttpsRequired));
+    }
+}
