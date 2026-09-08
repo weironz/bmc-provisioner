@@ -27,6 +27,16 @@ POST /api/v1/provision/plan
 如果 BMC 暴露多块管理网卡，第一次请求不填 `ethernetInterfaceUri` 会返回需要选择的错误；
 UI 应展示这些路径，让用户明确选择后再次创建计划。
 
+## 自签名证书探测
+
+```text
+POST /api/v1/certificates/probe
+```
+
+请求提供 `lessorUrl`、`scopeId` 与 `candidateIp`。服务先向 lessor 重新确认候选 BMC，
+然后在不发送账号密码的前提下读取其 HTTPS 叶证书 SHA-256 指纹。用户确认该值后，将它作为
+`certificateFingerprint` 传入 `plan`；后续 Redfish 连接会钉住该证书，而不是关闭 TLS 校验。
+
 ## 执行计划与查询状态
 
 ```text

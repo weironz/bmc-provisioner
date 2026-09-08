@@ -92,6 +92,8 @@ impl std::fmt::Debug for Credentials {
 #[serde(rename_all = "camelCase")]
 pub struct ProvisionPlan {
     pub source_ip: Ipv4Addr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_fingerprint: Option<String>,
     pub account_uri: String,
     pub ethernet_interface_uri: String,
     pub current_password_change_required: bool,

@@ -10,6 +10,7 @@ use axum::{
 use bmc_provisioner::{
     lessor::LessorClient,
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
+    redfish::{CertificateFingerprint, probe_certificate},
     workflow::ProvisionWorkflow,
 };
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,22 @@ struct PlanRequest {
     credentials: Credentials,
     target_network: StaticNetwork,
     ethernet_interface_uri: Option<String>,
+    certificate_fingerprint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificateProbeRequest {
+    lessor_url: String,
+    scope_id: u64,
+    candidate_ip: Ipv4Addr,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificateProbeResponse {
+    candidate: BmcCandidate,
+    fingerprint: CertificateFingerprint,
 }
 
 #[derive(Serialize)]
@@ -97,6 +114,7 @@ async fn main() {
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/candidates", get(candidates))
+        .route("/api/v1/certificates/probe", post(probe_bmc_certificate))
         .route("/api/v1/provision/plan", post(plan))
         .route("/api/v1/provision/plans/{plan_id}/apply", post(apply))
         .route("/api/v1/jobs/{job_id}", get(job))
@@ -137,26 +155,15 @@ async fn plan(
     State(state): State<Arc<AppState>>,
     Json(request): Json<PlanRequest>,
 ) -> Result<Json<PlannedProvision>, ApiError> {
-    let client = lessor_client(&request.lessor_url)?;
-    let candidates = client
-        .confirmed_bmcs(Some(request.scope_id))
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "could not validate BMC candidate with lessor");
-            ApiError::bad_gateway("could not validate the selected BMC with lessor")
-        })?;
-    let candidate = candidates
-        .into_iter()
-        .find(|candidate| candidate.ip == request.candidate_ip)
-        .ok_or_else(|| {
-            ApiError::bad_request("candidateIp is not a currently confirmed BMC in this scope")
-        })?;
+    let candidate =
+        confirmed_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
 
     let provision_plan = ProvisionWorkflow::plan(
         candidate.ip,
         &request.credentials,
         request.target_network,
         request.ethernet_interface_uri.as_deref(),
+        request.certificate_fingerprint.as_deref(),
     )
     .await
     .map_err(workflow_api_error)?;
@@ -171,6 +178,42 @@ async fn plan(
         candidate,
         plan: provision_plan,
     }))
+}
+
+async fn probe_bmc_certificate(
+    Json(request): Json<CertificateProbeRequest>,
+) -> Result<Json<CertificateProbeResponse>, ApiError> {
+    let candidate =
+        confirmed_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
+    let fingerprint = probe_certificate(candidate.ip).await.map_err(|error| {
+        tracing::warn!(error = %error, ip = %candidate.ip, "could not inspect BMC certificate");
+        ApiError::unprocessable("could not read a usable HTTPS certificate from this BMC")
+    })?;
+    Ok(Json(CertificateProbeResponse {
+        candidate,
+        fingerprint,
+    }))
+}
+
+async fn confirmed_candidate(
+    lessor_url: &str,
+    scope_id: u64,
+    candidate_ip: Ipv4Addr,
+) -> Result<BmcCandidate, ApiError> {
+    let client = lessor_client(lessor_url)?;
+    let candidates = client
+        .confirmed_bmcs(Some(scope_id))
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "could not validate BMC candidate with lessor");
+            ApiError::bad_gateway("could not validate the selected BMC with lessor")
+        })?;
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.ip == candidate_ip)
+        .ok_or_else(|| {
+            ApiError::bad_request("candidateIp is not a currently confirmed BMC in this scope")
+        })
 }
 
 async fn apply(

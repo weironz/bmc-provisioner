@@ -34,6 +34,13 @@ input:focus, select:focus { border-color: #0f766e; box-shadow: 0 0 0 3px #bde5d8
 .candidate:hover, .candidate.selected { border-color: #0f766e; background: #e5f5ef; }
 .candidate span { color: #5f746a; font-size: .88rem; }
 .interface-choice { max-width: 620px; margin-bottom: 18px; }
+.certificate { display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid #dce8e1; border-radius: 8px; background: #f7fbf8; margin: 0 0 12px; padding: 12px; }
+.certificate strong { color: #28544a; }
+.certificate p { color: #5f746a; font-size: .84rem; line-height: 1.45; margin-top: 3px; }
+.certificate button { border: 1px solid #0f766e; border-radius: 7px; background: #fff; color: #0f766e; flex: 0 0 auto; font-weight: 700; padding: 8px 10px; }
+.fingerprint-confirmation { align-items: start; display: flex; gap: 9px; line-height: 1.45; margin-bottom: 18px; }
+.fingerprint-confirmation input { margin-top: 3px; width: auto; }
+code { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .8rem; }
 .plan { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid #e2eae5; margin: 0 0 20px; }
 .plan div { border-bottom: 1px solid #e2eae5; padding: 12px 4px; }
 dt { color: #6d8177; font-size: .8rem; }
@@ -49,4 +56,5 @@ footer { color: #47665a; line-height: 1.55; margin: 22px 2px; }
   .fields, .fields.compact, .plan { grid-template-columns: 1fr; }
   .candidate { grid-template-columns: 1fr; gap: 4px; }
   .section-title { align-items: flex-start; flex-direction: column; }
+  .certificate { align-items: flex-start; flex-direction: column; }
 }

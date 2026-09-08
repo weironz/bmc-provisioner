@@ -1,9 +1,16 @@
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, sync::Arc};
 
 use reqwest::{Response, StatusCode, Url};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio_rustls::TlsConnector;
 
 use crate::model::{Credentials, StaticNetwork};
 
@@ -28,6 +35,60 @@ pub struct EthernetInterface {
     pub name: Option<String>,
 }
 
+/// SHA-256 fingerprint of the leaf certificate currently served by a BMC.
+/// It is public identity data, unlike an account credential, and is safe to return to the UI.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateFingerprint {
+    pub sha256: String,
+}
+
+impl CertificateFingerprint {
+    pub fn parse(value: &str) -> Result<Self, RedfishError> {
+        let normalized: String = value
+            .chars()
+            .filter(|character| !matches!(character, ':' | ' ' | '\t'))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized.len() != 64
+            || !normalized
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(RedfishError::InvalidCertificateFingerprint);
+        }
+        Ok(Self { sha256: normalized })
+    }
+
+    fn from_der(certificate: &[u8]) -> Self {
+        let hash = Sha256::digest(certificate);
+        let sha256 = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+        Self { sha256 }
+    }
+}
+
+/// Reads the current leaf certificate without sending credentials. Its TLS handshake still checks
+/// proof of private-key possession; only chain and hostname validation are deferred to explicit
+/// user fingerprint confirmation.
+pub async fn probe_certificate(ip: Ipv4Addr) -> Result<CertificateFingerprint, RedfishError> {
+    let stream = tokio::net::TcpStream::connect((ip, 443))
+        .await
+        .map_err(RedfishError::CertificateProbe)?;
+    let configuration = pinned_tls_config(None);
+    let connector = TlsConnector::from(Arc::new(configuration));
+    let connection = connector
+        .connect(ServerName::from(ip), stream)
+        .await
+        .map_err(RedfishError::CertificateProbe)?;
+    let certificate = connection
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .ok_or(RedfishError::CertificateMissing)?;
+    Ok(CertificateFingerprint::from_der(certificate.as_ref()))
+}
+
 /// Redfish client using HTTP Basic authentication. Certificate validation remains enabled.
 #[derive(Clone)]
 pub struct RedfishClient {
@@ -39,8 +100,28 @@ pub struct RedfishClient {
 
 impl RedfishClient {
     pub fn for_ipv4(ip: Ipv4Addr, credentials: &Credentials) -> Result<Self, RedfishError> {
+        Self::for_ipv4_with_fingerprint(ip, credentials, None)
+    }
+
+    /// Uses platform trust by default. When the user has explicitly confirmed a BMC's leaf
+    /// fingerprint, the connection instead pins that exact certificate for every request.
+    pub fn for_ipv4_with_fingerprint(
+        ip: Ipv4Addr,
+        credentials: &Credentials,
+        fingerprint: Option<&str>,
+    ) -> Result<Self, RedfishError> {
         let base_url = Url::parse(&format!("https://{ip}/")).map_err(RedfishError::InvalidUrl)?;
-        Self::new(base_url, credentials)
+        let client = match fingerprint {
+            Some(fingerprint) => {
+                let fingerprint = CertificateFingerprint::parse(fingerprint)?;
+                reqwest::Client::builder()
+                    .use_preconfigured_tls(pinned_tls_config(Some(fingerprint)))
+                    .build()
+                    .map_err(RedfishError::Client)?
+            }
+            None => reqwest::Client::new(),
+        };
+        Self::from_client(base_url, credentials, client)
     }
 
     pub fn new(base_url: Url, credentials: &Credentials) -> Result<Self, RedfishError> {
@@ -50,12 +131,7 @@ impl RedfishClient {
         if base_url.host_str().is_none() {
             return Err(RedfishError::MissingHost);
         }
-        Ok(Self {
-            base_url,
-            client: reqwest::Client::new(),
-            username: credentials.username.clone(),
-            password: credentials.current_password.clone(),
-        })
+        Self::from_client(base_url, credentials, reqwest::Client::new())
     }
 
     #[cfg(test)]
@@ -71,6 +147,25 @@ impl RedfishClient {
             username: credentials.username.clone(),
             password: credentials.current_password.clone(),
         }
+    }
+
+    fn from_client(
+        base_url: Url,
+        credentials: &Credentials,
+        client: reqwest::Client,
+    ) -> Result<Self, RedfishError> {
+        if base_url.scheme() != "https" {
+            return Err(RedfishError::HttpsRequired);
+        }
+        if base_url.host_str().is_none() {
+            return Err(RedfishError::MissingHost);
+        }
+        Ok(Self {
+            base_url,
+            client,
+            username: credentials.username.clone(),
+            password: credentials.current_password.clone(),
+        })
     }
 
     /// Recreate authentication after an account password has changed.
@@ -244,6 +339,74 @@ impl RedfishClient {
     }
 }
 
+#[derive(Debug)]
+struct PinnedCertificateVerifier {
+    expected: Option<CertificateFingerprint>,
+}
+
+impl ServerCertVerifier for PinnedCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        if let Some(expected) = &self.expected
+            && CertificateFingerprint::from_der(end_entity.as_ref()) != *expected
+        {
+            return Err(RustlsError::General(
+                "BMC certificate did not match the approved fingerprint".to_owned(),
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn pinned_tls_config(fingerprint: Option<CertificateFingerprint>) -> ClientConfig {
+    ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedCertificateVerifier {
+            expected: fingerprint,
+        }))
+        .with_no_client_auth()
+}
+
 fn static_ipv4_payload(network: &StaticNetwork) -> Value {
     json!({
         "DHCPv4": { "DHCPEnabled": false },
@@ -274,6 +437,14 @@ pub enum RedfishError {
     HttpsRequired,
     #[error("Redfish URL is missing a host")]
     MissingHost,
+    #[error("BMC certificate fingerprint must be a SHA-256 value")]
+    InvalidCertificateFingerprint,
+    #[error("could not inspect the BMC TLS certificate")]
+    CertificateProbe(#[source] std::io::Error),
+    #[error("BMC did not present a TLS certificate")]
+    CertificateMissing,
+    #[error("could not create the HTTPS client")]
+    Client(#[source] reqwest::Error),
     #[error("Redfish returned a link outside the selected BMC")]
     CrossOriginLink,
     #[error("could not reach the BMC Redfish service")]
@@ -527,5 +698,25 @@ mod tests {
             "255.255.255.0"
         );
         assert_eq!(payload["IPv4StaticAddresses"][0]["Gateway"], "192.168.20.1");
+    }
+
+    #[test]
+    fn normalizes_colon_separated_certificate_fingerprint() {
+        let fingerprint = CertificateFingerprint::parse(
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        )
+        .unwrap();
+        assert_eq!(
+            fingerprint.sha256,
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_certificate_fingerprint() {
+        assert!(matches!(
+            CertificateFingerprint::parse("not-a-fingerprint"),
+            Err(RedfishError::InvalidCertificateFingerprint)
+        ));
     }
 }

@@ -46,6 +46,8 @@
   let targetPrefix = 24;
   let targetGateway = '';
   let interfaceUri = '';
+  let certificateFingerprint = '';
+  let certificateConfirmed = false;
   let interfaceChoices: string[] = [];
   let plan: Plan | undefined;
   let planId = '';
@@ -69,6 +71,8 @@
 
   function choose(candidate: Candidate) {
     selectedIp = candidate.ip;
+    certificateFingerprint = '';
+    certificateConfirmed = false;
     clearPlan();
     error = '';
     message = `已选择 ${candidate.ip}${candidate.mac ? `（${candidate.mac}）` : ''}`;
@@ -125,7 +129,8 @@
           candidateIp: selectedIp,
           credentials: { username, currentPassword, newPassword },
           targetNetwork: { address: targetAddress, prefix: targetPrefix, gateway: targetGateway },
-          ethernetInterfaceUri: interfaceUri || undefined
+          ethernetInterfaceUri: interfaceUri || undefined,
+          certificateFingerprint: certificateConfirmed ? certificateFingerprint : undefined
         })
       });
       if (!response.ok) {
@@ -142,6 +147,31 @@
       error = reason instanceof Error ? reason.message : '创建计划失败';
     } finally {
       planning = false;
+    }
+  }
+
+  async function probeCertificate() {
+    if (!selectedIp) {
+      error = '请先选择 lessor 已确认的 BMC。';
+      return;
+    }
+    error = '';
+    certificateConfirmed = false;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/certificates/probe`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ lessorUrl, scopeId, candidateIp: selectedIp })
+      });
+      if (!response.ok) {
+        const failure = await readFailure(response);
+        throw new Error(failure.error ?? '无法读取 BMC HTTPS 证书');
+      }
+      const result = (await response.json()) as { fingerprint: { sha256: string } };
+      certificateFingerprint = result.fingerprint.sha256;
+      message = '已读取 BMC 证书指纹。确认后，Redfish 仅信任此证书。';
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '读取证书失败';
     }
   }
 
@@ -205,7 +235,7 @@
     <span class="local">仅本机 localhost</span>
   </header>
 
-  <p class="notice">密码只在本次浏览器请求中使用，不会显示在计划或任务结果中。请先确认目标 BMC 的 HTTPS 证书提示。</p>
+  <p class="notice">密码只在本次浏览器请求中使用，不会显示在计划或任务结果中。BMC 使用自签名 HTTPS 证书时，必须先读取并确认指纹。</p>
 
   <section aria-labelledby="lessor-heading">
     <div class="section-title">
@@ -248,6 +278,19 @@
       <label>前缀 <input bind:value={targetPrefix} type="number" min="1" max="32" /></label>
       <label>网关 <input bind:value={targetGateway} inputmode="decimal" placeholder="192.168.10.1" /></label>
     </div>
+    <div class="certificate">
+      <div>
+        <strong>自签名 HTTPS 证书</strong>
+        <p>标准可信证书可直接生成计划。若 BMC 使用自签名证书，先读取指纹并明确确认；程序不会跳过 TLS 校验。</p>
+      </div>
+      <button onclick={probeCertificate} disabled={!selectedIp}>读取证书指纹</button>
+    </div>
+    {#if certificateFingerprint}
+      <label class="fingerprint-confirmation">
+        <input bind:checked={certificateConfirmed} type="checkbox" />
+        <span>我确认此 BMC 的 SHA-256 证书指纹：<code>{certificateFingerprint}</code></span>
+      </label>
+    {/if}
     {#if interfaceChoices.length > 0}
       <label class="interface-choice">BMC 暴露多块管理网卡，请选择
         <select bind:value={interfaceUri}>

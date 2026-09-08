@@ -20,13 +20,19 @@ impl ProvisionWorkflow {
         credentials: &Credentials,
         target_network: StaticNetwork,
         requested_interface_uri: Option<&str>,
+        certificate_fingerprint: Option<&str>,
     ) -> Result<ProvisionPlan, WorkflowError> {
         target_network.validate()?;
-        let client = RedfishClient::for_ipv4(source_ip, credentials)?;
+        let client = RedfishClient::for_ipv4_with_fingerprint(
+            source_ip,
+            credentials,
+            certificate_fingerprint,
+        )?;
         let inventory = client.discover().await?;
         let interface = select_interface(&inventory, requested_interface_uri)?;
         Ok(ProvisionPlan {
             source_ip,
+            certificate_fingerprint: certificate_fingerprint.map(ToOwned::to_owned),
             account_uri: inventory.account.uri,
             ethernet_interface_uri: interface.uri,
             current_password_change_required: inventory.account.password_change_required,
@@ -38,7 +44,11 @@ impl ProvisionWorkflow {
         plan: ProvisionPlan,
         credentials: Credentials,
     ) -> Result<ProvisionResult, WorkflowError> {
-        let client = RedfishClient::for_ipv4(plan.source_ip, &credentials)?;
+        let client = RedfishClient::for_ipv4_with_fingerprint(
+            plan.source_ip,
+            &credentials,
+            plan.certificate_fingerprint.as_deref(),
+        )?;
         let inventory = client.discover().await?;
         if inventory.account.uri != plan.account_uri {
             return Err(WorkflowError::PlanChanged(
