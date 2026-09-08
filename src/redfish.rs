@@ -58,6 +58,21 @@ impl RedfishClient {
         })
     }
 
+    #[cfg(test)]
+    fn new_for_mock(base_url: Url, credentials: &Credentials) -> Self {
+        assert_eq!(
+            base_url.scheme(),
+            "http",
+            "mock Redfish must use local HTTP"
+        );
+        Self {
+            base_url,
+            client: reqwest::Client::new(),
+            username: credentials.username.clone(),
+            password: credentials.current_password.clone(),
+        }
+    }
+
     /// Recreate authentication after an account password has changed.
     pub fn with_password(&self, password: String) -> Self {
         Self {
@@ -168,14 +183,7 @@ impl RedfishClient {
         self.send_json(
             reqwest::Method::PATCH,
             interface_uri,
-            json!({
-                "DHCPv4": { "DHCPEnabled": false },
-                "IPv4StaticAddresses": [{
-                    "Address": network.address.to_string(),
-                    "SubnetMask": network.subnet_mask_string(),
-                    "Gateway": network.gateway.to_string(),
-                }],
-            }),
+            static_ipv4_payload(network),
         )
         .await
     }
@@ -234,6 +242,17 @@ impl RedfishClient {
         }
         Ok(url)
     }
+}
+
+fn static_ipv4_payload(network: &StaticNetwork) -> Value {
+    json!({
+        "DHCPv4": { "DHCPEnabled": false },
+        "IPv4StaticAddresses": [{
+            "Address": network.address.to_string(),
+            "SubnetMask": network.subnet_mask_string(),
+            "Gateway": network.gateway.to_string(),
+        }],
+    })
 }
 
 async fn ensure_success(response: Response) -> Result<Response, RedfishError> {
@@ -338,6 +357,10 @@ struct EthernetInterfaceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     fn credentials() -> Credentials {
         Credentials {
@@ -373,5 +396,136 @@ mod tests {
                 Err(error) => error,
             };
         assert!(matches!(error, RedfishError::HttpsRequired));
+    }
+
+    async fn mock_discovery(server: &MockServer, password_change_required: bool, action: bool) {
+        let root = json!({
+            "AccountService": { "@odata.id": "/redfish/v1/AccountService" },
+            "Managers": { "@odata.id": "/redfish/v1/Managers" }
+        });
+        let account_service =
+            json!({ "Accounts": { "@odata.id": "/redfish/v1/AccountService/Accounts" } });
+        let accounts =
+            json!({ "Members": [{ "@odata.id": "/redfish/v1/AccountService/Accounts/admin" }] });
+        let actions = if action {
+            json!({ "#ManagerAccount.ChangePassword": { "target": "/redfish/v1/AccountService/Accounts/admin/Actions/ManagerAccount.ChangePassword" } })
+        } else {
+            json!({})
+        };
+        let account = json!({
+            "UserName": "admin",
+            "PasswordChangeRequired": password_change_required,
+            "Actions": actions
+        });
+        let managers = json!({ "Members": [{ "@odata.id": "/redfish/v1/Managers/BMC" }] });
+        let manager = json!({ "EthernetInterfaces": { "@odata.id": "/redfish/v1/Managers/BMC/EthernetInterfaces" } });
+        let interfaces = json!({ "Members": [{ "@odata.id": "/redfish/v1/Managers/BMC/EthernetInterfaces/eth0" }] });
+        let interface = json!({ "Id": "eth0", "Name": "BMC management" });
+
+        for (resource, body) in [
+            ("/redfish/v1/", root),
+            ("/redfish/v1/AccountService", account_service),
+            ("/redfish/v1/AccountService/Accounts", accounts),
+            ("/redfish/v1/AccountService/Accounts/admin", account),
+            ("/redfish/v1/Managers", managers),
+            ("/redfish/v1/Managers/BMC", manager),
+            ("/redfish/v1/Managers/BMC/EthernetInterfaces", interfaces),
+            (
+                "/redfish/v1/Managers/BMC/EthernetInterfaces/eth0",
+                interface,
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(resource))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn discovers_resources_and_uses_patch_for_normal_password_change() {
+        let server = MockServer::start().await;
+        mock_discovery(&server, false, false).await;
+        Mock::given(method("PATCH"))
+            .and(path("/redfish/v1/AccountService/Accounts/admin"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/redfish/v1/Managers/BMC/EthernetInterfaces/eth0"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let inventory = client.discover().await.unwrap();
+        assert_eq!(
+            inventory.account.uri,
+            "/redfish/v1/AccountService/Accounts/admin"
+        );
+        assert_eq!(inventory.ethernet_interfaces[0].id, "eth0");
+        client
+            .change_password(&inventory.account, "new-password")
+            .await
+            .unwrap();
+        client
+            .configure_static_ipv4(
+                &inventory.ethernet_interfaces[0].uri,
+                &StaticNetwork {
+                    address: Ipv4Addr::new(10, 10, 1, 9),
+                    prefix: 24,
+                    gateway: Ipv4Addr::new(10, 10, 1, 1),
+                },
+            )
+            .await
+            .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn uses_change_password_action_when_bmc_requires_it() {
+        let server = MockServer::start().await;
+        mock_discovery(&server, true, true).await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/AccountService/Accounts/admin/Actions/ManagerAccount.ChangePassword",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let inventory = client.discover().await.unwrap();
+        client
+            .change_password(&inventory.account, "new-password")
+            .await
+            .unwrap();
+        server.verify().await;
+    }
+
+    #[test]
+    fn static_ipv4_payload_disables_dhcp_and_preserves_gateway() {
+        let payload = static_ipv4_payload(&StaticNetwork {
+            address: Ipv4Addr::new(192, 168, 20, 50),
+            prefix: 24,
+            gateway: Ipv4Addr::new(192, 168, 20, 1),
+        });
+
+        assert_eq!(payload["DHCPv4"]["DHCPEnabled"], false);
+        assert_eq!(
+            payload["IPv4StaticAddresses"][0]["Address"],
+            "192.168.20.50"
+        );
+        assert_eq!(
+            payload["IPv4StaticAddresses"][0]["SubnetMask"],
+            "255.255.255.0"
+        );
+        assert_eq!(payload["IPv4StaticAddresses"][0]["Gateway"], "192.168.20.1");
     }
 }

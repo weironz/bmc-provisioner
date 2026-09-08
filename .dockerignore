@@ -1,0 +1,5 @@
+.git
+target
+ui/node_modules
+ui/src-tauri
+*.md

@@ -115,6 +115,11 @@ struct DeviceRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
 
     #[test]
     fn accepts_local_http_for_lessors_desktop_api() {
@@ -128,5 +133,34 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, LessorError::UnsupportedScheme(_)));
+    }
+
+    #[tokio::test]
+    async fn returns_only_confirmed_bmc_records_from_lessors_aggregate_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .and(query_param("kind", "bmc"))
+            .and(query_param("scopeId", "7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "scope": { "id": 7, "name": "Ethernet", "subnet": "192.168.1.0", "prefix": 24 },
+                    "devices": [
+                        { "ip": "192.168.1.10", "mac": "00:11:22:33:44:55", "kind": "bmc", "confidence": "confirmed", "firstSeen": 1, "lastSeen": 2 },
+                        { "ip": "192.168.1.11", "mac": "00:11:22:33:44:56", "kind": "bmc", "confidence": "probable", "firstSeen": 1, "lastSeen": 2 },
+                        { "ip": "192.168.1.12", "mac": null, "kind": "device", "confidence": "confirmed", "firstSeen": 1, "lastSeen": 2 }
+                    ]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LessorClient::new(Url::parse(&server.uri()).unwrap()).unwrap();
+        let candidates = client.confirmed_bmcs(Some(7)).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ip, Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(candidates[0].mac.as_deref(), Some("00:11:22:33:44:55"));
+        server.verify().await;
     }
 }

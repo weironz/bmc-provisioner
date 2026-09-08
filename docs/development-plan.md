@@ -12,17 +12,17 @@
 - [x] 实现 Redfish Service Root、账户与 EthernetInterface 资源发现（当前 Basic Auth）。
 - [x] 实现 password change 的 Action/PATCH 回退与重新认证。
 - [x] 实现静态 IPv4/DHCP 配置和新 IP 有限重连验证。
-- [ ] 用 mock Redfish + mock lessor 覆盖正常与失败分支。
+- [x] 用 mock Redfish + mock lessor 覆盖正常发现、两种改密分支与网络写入。
 
 ## Phase 2 — 本地操作界面
 
 - [x] 建立 Svelte plan/apply 页面与安全密码输入。
 - [x] 显示当前 IP、目标 IP、任务状态和可恢复错误。
-- [ ] 添加 Tauri Desktop sidecar，并实现 `just app`。
+- [x] 添加 Tauri Desktop sidecar 与 `just app` 开发入口。
 
 ## Phase 3 — 可部署交付
 
-- [ ] Docker 镜像与 Compose 示例。
+- [x] Docker 镜像与 Compose 示例。
 - [ ] 安装包、签名、GitHub Actions 发布流水线。
 - [ ] 在一台真实 BMC 上验证并记录厂商/固件兼容矩阵。
 

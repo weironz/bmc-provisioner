@@ -14,7 +14,10 @@ use bmc_provisioner::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tower_http::cors::CorsLayer;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
@@ -87,6 +90,10 @@ async fn main() {
         .init();
 
     let state = Arc::new(AppState::default());
+    let ui_directory =
+        std::env::var("BMC_PROVISIONER_UI_DIR").unwrap_or_else(|_| "ui/dist".to_owned());
+    let index = format!("{ui_directory}/index.html");
+    let static_ui = ServeDir::new(ui_directory).not_found_service(ServeFile::new(index));
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/candidates", get(candidates))
@@ -96,10 +103,12 @@ async fn main() {
         // The service itself only listens on loopback. This permits the Vite development UI to
         // call it from a different loopback port; the packaged desktop UI will be same-origin.
         .layer(CorsLayer::very_permissive())
+        .fallback_service(static_ui)
         .with_state(state);
-    let address: SocketAddr = "127.0.0.1:6770"
+    let address: SocketAddr = std::env::var("BMC_PROVISIONER_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:6770".to_owned())
         .parse()
-        .expect("valid default bind address");
+        .expect("BMC_PROVISIONER_BIND must be a socket address");
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("bind local HTTP server");

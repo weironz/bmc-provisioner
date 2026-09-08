@@ -1,0 +1,25 @@
+[package]
+name = "bmc-provisioner-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop shell for the local bmc-provisionerd service"
+license = "Apache-2.0"
+default-run = "bmc-provisioner-desktop"
+
+# Keep the desktop shell isolated from the service workspace: normal service tests do not need to
+# compile WebView/Tauri dependencies.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading"
+] }

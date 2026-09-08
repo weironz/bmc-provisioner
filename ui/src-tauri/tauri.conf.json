@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "bmc-provisioner",
+  "version": "0.1.0",
+  "identifier": "io.bmc-provisioner.desktop",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "beforeBuildCommand": "bun run build",
+    "devUrl": "http://127.0.0.1:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "bmc-provisioner",
+        "width": 1080,
+        "height": 820,
+        "minWidth": 760,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "shortDescription": "单台 BMC 初始配置工具",
+    "longDescription": "从 lessor 获取已确认 BMC 的 DHCP 地址，再通过 Redfish 修改密码和静态 IPv4 配置。",
+    "icon": ["icons/icon.ico"],
+    "externalBin": ["binaries/bmc-provisionerd"]
+  }
+}

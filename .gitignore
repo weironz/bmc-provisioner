@@ -1,6 +1,12 @@
 /target/
 ui/node_modules/
 ui/dist/
+ui/src-tauri/target/
+ui/src-tauri/binaries/
+ui/src-tauri/icons/*.png
+ui/src-tauri/icons/*.icns
+ui/src-tauri/icons/android/
+ui/src-tauri/icons/ios/
 .env
 .idea/
 .vscode/

@@ -39,3 +39,19 @@ bun run dev
 
 然后访问 Vite 输出的本机地址（默认 `http://127.0.0.1:5173`）。先启动
 `bmc-provisionerd`，页面才能访问 `127.0.0.1:6770` 的本地 API。
+
+桌面开发入口会构建 sidecar 并自动停止已有的开发桌面壳：
+
+```powershell
+just app
+```
+
+容器版本复用同一个 Rust 服务和前端构建产物：
+
+```powershell
+docker compose up --build
+```
+
+容器端口只映射到主机 loopback，浏览器访问 `http://127.0.0.1:6770`。若 lessor 仍运行在
+Windows 主机，页面中的 lessor 地址应填写 `http://host.docker.internal:6767`，而不是
+`127.0.0.1`。

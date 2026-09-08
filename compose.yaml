@@ -1,0 +1,8 @@
+services:
+  bmc-provisioner:
+    build: .
+    image: bmc-provisioner:dev
+    ports:
+      - "127.0.0.1:6770:6770"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

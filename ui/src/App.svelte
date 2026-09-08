@@ -1,7 +1,11 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
 
-  const API_BASE = 'http://127.0.0.1:6770';
+  // Vite and Tauri use a separate UI origin during development / desktop execution. Docker serves
+  // this page from bmc-provisionerd itself, so same-origin keeps the browser-side API local.
+  const API_BASE = window.location.protocol === 'http:' && window.location.port !== '5173'
+    ? window.location.origin
+    : 'http://127.0.0.1:6770';
 
   type Candidate = {
     scopeId: number;
