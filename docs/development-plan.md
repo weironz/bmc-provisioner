@@ -9,6 +9,7 @@
 ## Phase 1 — 可测试的核心闭环
 
 - [x] 实现 lessor candidate client 与响应校验。
+- [x] 为已知静态 IP 提供与 provisioning 隔离的只读 Redfish 诊断。
 - [x] 实现 Redfish Service Root、账户与 EthernetInterface 资源发现（当前 Basic Auth）。
 - [x] 实现自签名 BMC 的无凭据指纹探测与显式证书钉扎。
 - [x] 实现 password change 的 Action/PATCH 回退与重新认证。

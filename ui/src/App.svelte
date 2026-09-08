@@ -33,12 +33,20 @@
     error?: string;
   };
 
+  type StaticDiagnostic = {
+    bmcIp: string;
+    accountUri: string;
+    passwordChangeRequired: boolean;
+    ethernetInterfaces: Array<{ uri: string; id: string; name?: string }>;
+  };
+
   type ApiFailure = { error?: string; details?: { ethernetInterfaceUris?: string[] } };
 
   let lessorUrl = 'http://127.0.0.1:6767';
   let scopeId = 1;
   let candidates: Candidate[] = [];
   let selectedIp = '';
+  let knownStaticIp = '';
   let username = 'admin';
   let currentPassword = '';
   let newPassword = '';
@@ -48,6 +56,9 @@
   let interfaceUri = '';
   let certificateFingerprint = '';
   let certificateConfirmed = false;
+  let knownStaticFingerprint = '';
+  let knownStaticFingerprintConfirmed = false;
+  let staticDiagnostic: StaticDiagnostic | undefined;
   let interfaceChoices: string[] = [];
   let plan: Plan | undefined;
   let planId = '';
@@ -57,6 +68,7 @@
   let loadingCandidates = false;
   let planning = false;
   let applying = false;
+  let diagnosingStatic = false;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
   onDestroy(() => {
@@ -175,6 +187,62 @@
     }
   }
 
+  async function probeKnownStaticCertificate() {
+    if (!knownStaticIp) {
+      error = '请填写已知静态 BMC IP。';
+      return;
+    }
+    error = '';
+    knownStaticFingerprintConfirmed = false;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/diagnostics/redfish/certificate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ bmcIp: knownStaticIp })
+      });
+      if (!response.ok) {
+        const failure = await readFailure(response);
+        throw new Error(failure.error ?? '无法读取静态 BMC HTTPS 证书');
+      }
+      const result = (await response.json()) as { sha256: string };
+      knownStaticFingerprint = result.sha256;
+      message = '已读取静态 BMC 证书指纹。确认后可进行只读 Redfish 诊断。';
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '读取静态 BMC 证书失败';
+    }
+  }
+
+  async function diagnoseKnownStaticBmc() {
+    if (!knownStaticIp || !username || !currentPassword) {
+      error = '只读诊断需要静态 BMC IP、用户名和当前密码。';
+      return;
+    }
+    diagnosingStatic = true;
+    error = '';
+    staticDiagnostic = undefined;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/diagnostics/redfish`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          bmcIp: knownStaticIp,
+          credentials: { username, currentPassword },
+          certificateFingerprint: knownStaticFingerprintConfirmed ? knownStaticFingerprint : undefined
+        })
+      });
+      if (!response.ok) {
+        const failure = await readFailure(response);
+        throw new Error(failure.error ?? '静态 BMC Redfish 诊断失败');
+      }
+      staticDiagnostic = (await response.json()) as StaticDiagnostic;
+      message = '只读 Redfish 诊断完成；未创建配置计划，也未对 BMC 发出修改请求。';
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '静态 BMC 诊断失败';
+    } finally {
+      diagnosingStatic = false;
+    }
+  }
+
   async function applyPlan() {
     if (!planId) return;
     applying = true;
@@ -261,6 +329,34 @@
         {/each}
       </div>
     {/if}
+    <div class="static-diagnostic">
+      <div>
+        <p class="step">可选，只读</p>
+        <h3>已知静态 BMC 诊断</h3>
+        <p>用于已配置静态地址、尚未被 lessor 发现的 BMC。此通道只允许 TLS/Redfish GET，不会产生计划或执行按钮。</p>
+      </div>
+      <div class="static-controls">
+        <label>静态 BMC IP <input bind:value={knownStaticIp} inputmode="decimal" placeholder="172.16.40.35" /></label>
+        <button onclick={probeKnownStaticCertificate} disabled={!knownStaticIp}>读取证书指纹</button>
+      </div>
+      {#if knownStaticFingerprint}
+        <label class="fingerprint-confirmation">
+          <input bind:checked={knownStaticFingerprintConfirmed} type="checkbox" />
+          <span>我确认静态 BMC 的 SHA-256 证书指纹：<code>{knownStaticFingerprint}</code></span>
+        </label>
+      {/if}
+      <button class="read-only" onclick={diagnoseKnownStaticBmc} disabled={diagnosingStatic || !knownStaticIp}>
+        {diagnosingStatic ? '正在读取 Redfish…' : '只读检查 Redfish 资源'}
+      </button>
+      {#if staticDiagnostic}
+        <dl class="plan diagnostic-result">
+          <div><dt>BMC IP</dt><dd>{staticDiagnostic.bmcIp}</dd></div>
+          <div><dt>账户资源</dt><dd>{staticDiagnostic.accountUri}</dd></div>
+          <div><dt>强制改密</dt><dd>{staticDiagnostic.passwordChangeRequired ? '是' : '否'}</dd></div>
+          <div><dt>管理网卡</dt><dd>{staticDiagnostic.ethernetInterfaces.map((item) => item.name ?? item.id).join('，')}</dd></div>
+        </dl>
+      {/if}
+    </div>
   </section>
 
   <section aria-labelledby="network-heading">

@@ -33,6 +33,12 @@ input:focus, select:focus { border-color: #0f766e; box-shadow: 0 0 0 3px #bde5d8
 .candidate { display: grid; grid-template-columns: 160px 1fr; align-items: center; text-align: left; border: 1px solid #d8e4dc; border-radius: 8px; background: #fbfdfb; color: #1c3128; padding: 13px; }
 .candidate:hover, .candidate.selected { border-color: #0f766e; background: #e5f5ef; }
 .candidate span { color: #5f746a; font-size: .88rem; }
+.static-diagnostic { border-top: 1px solid #dfe9e2; margin-top: 20px; padding-top: 20px; }
+.static-diagnostic h3 { font-size: 1rem; margin: 3px 0; }
+.static-diagnostic > div > p:last-child { color: #5f746a; font-size: .86rem; line-height: 1.45; }
+.static-controls { align-items: end; display: grid; gap: 12px; grid-template-columns: minmax(180px, 340px) auto; margin: 14px 0 12px; }
+.static-controls button, .read-only { border: 1px solid #496c5b; border-radius: 7px; background: #fff; color: #305443; font-weight: 700; padding: 9px 11px; }
+.diagnostic-result { margin-top: 18px; }
 .interface-choice { max-width: 620px; margin-bottom: 18px; }
 .certificate { display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid #dce8e1; border-radius: 8px; background: #f7fbf8; margin: 0 0 12px; padding: 12px; }
 .certificate strong { color: #28544a; }
@@ -54,6 +60,7 @@ footer { color: #47665a; line-height: 1.55; margin: 22px 2px; }
   main { width: min(100% - 20px, 980px); padding-top: 24px; }
   section { padding: 18px; }
   .fields, .fields.compact, .plan { grid-template-columns: 1fr; }
+  .static-controls { align-items: stretch; grid-template-columns: 1fr; }
   .candidate { grid-template-columns: 1fr; gap: 4px; }
   .section-title { align-items: flex-start; flex-direction: column; }
   .certificate { align-items: flex-start; flex-direction: column; }

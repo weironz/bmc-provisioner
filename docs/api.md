@@ -47,3 +47,15 @@ GET  /api/v1/jobs/{jobId}
 `apply` 请求再次携带 `credentials`，因为服务永不把密码放入 plan 或 job。它返回 HTTP
 202 与 job。网络写入后最多以 5 秒间隔重连 12 次；连接尚未恢复时结果是
 `network_changed_unverified`，不视为完成。
+
+## 已知静态 BMC 的只读诊断
+
+```text
+POST /api/v1/diagnostics/redfish/certificate
+POST /api/v1/diagnostics/redfish
+```
+
+第一个接口只需要用户明确输入的 `bmcIp`，用于无凭据读取证书指纹。第二个接口接受
+`bmcIp`、当前用户名/密码和可选、已确认的 `certificateFingerprint`，只读取 Redfish
+Service Root、账户与管理网卡。它永不创建 provisioning plan/job，也没有 PATCH 或 POST
+给 BMC 的代码路径。

@@ -10,7 +10,7 @@ use axum::{
 use bmc_provisioner::{
     lessor::LessorClient,
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
-    redfish::{CertificateFingerprint, probe_certificate},
+    redfish::{CertificateFingerprint, EthernetInterface, RedfishClient, probe_certificate},
     workflow::ProvisionWorkflow,
 };
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,46 @@ struct CertificateProbeResponse {
     fingerprint: CertificateFingerprint,
 }
 
+/// Explicitly entered by the operator. This type is accepted only by read-only diagnostic routes;
+/// it is deliberately not accepted by provisioning plan/apply routes.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownStaticBmcRequest {
+    bmc_ip: Ipv4Addr,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOnlyRedfishRequest {
+    bmc_ip: Ipv4Addr,
+    credentials: ReadOnlyCredentials,
+    certificate_fingerprint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOnlyCredentials {
+    username: String,
+    current_password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOnlyRedfishDiagnostic {
+    bmc_ip: Ipv4Addr,
+    account_uri: String,
+    password_change_required: bool,
+    ethernet_interfaces: Vec<ReadOnlyEthernetInterface>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOnlyEthernetInterface {
+    uri: String,
+    id: String,
+    name: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlannedProvision {
@@ -115,6 +155,14 @@ async fn main() {
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/candidates", get(candidates))
         .route("/api/v1/certificates/probe", post(probe_bmc_certificate))
+        .route(
+            "/api/v1/diagnostics/redfish/certificate",
+            post(probe_known_static_certificate),
+        )
+        .route(
+            "/api/v1/diagnostics/redfish",
+            post(read_only_redfish_diagnostic),
+        )
         .route("/api/v1/provision/plan", post(plan))
         .route("/api/v1/provision/plans/{plan_id}/apply", post(apply))
         .route("/api/v1/jobs/{job_id}", get(job))
@@ -193,6 +241,60 @@ async fn probe_bmc_certificate(
         candidate,
         fingerprint,
     }))
+}
+
+/// This does not require a lessor candidate because the IP was explicitly entered by the user.
+/// It remains safe: it only completes a TLS handshake and returns a public certificate fingerprint.
+async fn probe_known_static_certificate(
+    Json(request): Json<KnownStaticBmcRequest>,
+) -> Result<Json<CertificateFingerprint>, ApiError> {
+    let fingerprint = probe_certificate(request.bmc_ip).await.map_err(|error| {
+        tracing::warn!(error = %error, ip = %request.bmc_ip, "could not inspect known BMC certificate");
+        ApiError::unprocessable("could not read a usable HTTPS certificate from this BMC")
+    })?;
+    Ok(Json(fingerprint))
+}
+
+/// A read-only escape hatch for BMCs that already have a static address. It constructs no plan,
+/// creates no job, and only calls Redfish GET endpoints through `discover`.
+async fn read_only_redfish_diagnostic(
+    Json(request): Json<ReadOnlyRedfishRequest>,
+) -> Result<Json<ReadOnlyRedfishDiagnostic>, ApiError> {
+    let credentials = Credentials {
+        username: request.credentials.username,
+        current_password: request.credentials.current_password,
+        new_password: String::new(),
+    };
+    let client = RedfishClient::for_ipv4_with_fingerprint(
+        request.bmc_ip,
+        &credentials,
+        request.certificate_fingerprint.as_deref(),
+    )
+    .map_err(workflow_redfish_api_error)?;
+    let inventory = client
+        .discover()
+        .await
+        .map_err(workflow_redfish_api_error)?;
+    Ok(Json(ReadOnlyRedfishDiagnostic {
+        bmc_ip: request.bmc_ip,
+        account_uri: inventory.account.uri,
+        password_change_required: inventory.account.password_change_required,
+        ethernet_interfaces: inventory
+            .ethernet_interfaces
+            .into_iter()
+            .map(ReadOnlyEthernetInterface::from)
+            .collect(),
+    }))
+}
+
+impl From<EthernetInterface> for ReadOnlyEthernetInterface {
+    fn from(interface: EthernetInterface) -> Self {
+        Self {
+            uri: interface.uri,
+            id: interface.id,
+            name: interface.name,
+        }
+    }
 }
 
 async fn confirmed_candidate(
@@ -318,6 +420,11 @@ fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiErr
     }
     tracing::warn!(error = %error, "could not build BMC provisioning plan");
     ApiError::unprocessable("BMC could not produce a supported provisioning plan")
+}
+
+fn workflow_redfish_api_error(error: bmc_provisioner::redfish::RedfishError) -> ApiError {
+    tracing::warn!(error = %error, "could not complete read-only Redfish diagnostic");
+    ApiError::unprocessable("BMC could not complete the requested read-only Redfish diagnostic")
 }
 
 struct ApiError {

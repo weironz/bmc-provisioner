@@ -72,6 +72,13 @@ GET  /api/v1/jobs/{id}
 Redfish；生成的 plan 仅保存在内存，不含密码。`apply` 以 `plan_id` 和一次性重传的
 账号密码发起任务并返回 job id。单 BMC 同时只允许一个进行中的 job。
 
+### 已知静态 BMC 的只读诊断
+
+当 BMC 已经配置静态地址、不能作为 lessor DHCP candidate 时，用户可明确输入 IP 调用
+`POST /api/v1/diagnostics/redfish/certificate` 与 `POST /api/v1/diagnostics/redfish`。前者只
+读取 TLS 指纹，后者仅用 GET 发现账户和管理网卡；该通道不能创建 plan、不能创建 job，也
+不能调用任何 Redfish PATCH/POST。
+
 ## Redfish 兼容策略
 
 先从 `/redfish/v1` 读取链接，不能把 `ManagerId`、账号 ID 或网卡 ID 写死。
