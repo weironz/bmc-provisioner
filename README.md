@@ -1,7 +1,8 @@
 # bmc-provisioner
 
-面向现场首次配置单台 BMC 的桌面与容器化工具。它从本机 `lessor` 获取已经
-确认的 BMC 临时 DHCP 地址，再用 Redfish 修改初始密码和 IPv4 网络配置。
+面向现场首次配置单台 BMC 的桌面与容器化工具。它从 `lessor` 获取已确认的 BMC，
+或获取 DHCP Relay 作用域的活动租约候选；候选在执行前仍会由 Redfish 确认，再修改
+初始密码和 IPv4 网络配置。
 
 当前范围、架构与开发顺序见：
 
@@ -14,9 +15,8 @@
 
 ## 当前开发版本
 
-服务核心已经可以读取 lessor 的 confirmed BMC，并通过标准 Redfish 路径创建计划和
-执行改密/静态 IPv4 任务。当前只使用 HTTPS Basic Auth；桌面 UI、BMC 自签名证书的
-指纹确认、Mock 测试及真实硬件验证仍在后续阶段，不能将此开发版本直接当作生产工具。
+服务核心可以读取 lessor 的 confirmed BMC；对 Relay 网段则读取活动 DHCP 租约，并在
+执行前完成 HTTPS/Redfish 验证。它通过标准 Redfish 路径执行改密/静态 IPv4 任务。
 
 本地构建与检查：
 
@@ -31,7 +31,7 @@ cargo run --bin bmc-provisionerd
 
 每次配置完成或失败后，BMC 的 MAC、源/目标地址、证书指纹、配置结果和最后检查状态会
 保存在本机 SQLite 清单中（Windows 默认位于 `%LOCALAPPDATA%\\bmc-provisioner\\inventory.sqlite3`）。
-每行可关联一个凭据档案；SQLite 只保存档案名，用户名与密码保存在 Windows 凭据管理器。
+每行可关联一个凭据档案；SQLite 只保存档案名，桌面端密码保存在系统凭据管理器。
 
 另开一个终端可启动开发界面：
 
@@ -67,7 +67,9 @@ docker compose up -d
 1. 通过 `http://127.0.0.1:8080` 打开 lessor，选择网卡并创建 DHCP 作用域；
 2. 通过 `http://127.0.0.1:6770` 打开 bmc-provisioner；lessor 地址保持默认
    `http://127.0.0.1:8080`；
-3. 在“凭据档案”创建 BMC 凭据，再在清单每行选择对应档案。
+3. 在“凭据档案”创建 BMC 凭据，再在清单每行选择对应档案。Compose 默认使用
+   `BMC_PROVISIONER_SESSION_CREDENTIALS=1`：由于容器通常没有系统密钥链，密码只
+   保存到服务内存，容器重启后须重新输入，且绝不会写入 SQLite。
 
 这套 Compose 使用命名卷持久化 lessor 配置/租约和 bmc-provisioner 清单。不要将
 `docker compose down -v` 用于生产环境，它会删除这些卷。
