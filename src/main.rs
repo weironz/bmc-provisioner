@@ -153,6 +153,12 @@ enum JobState {
 
 #[tokio::main]
 async fn main() {
+    // `reqwest` and the explicit certificate-pinning path can enable more than one Rustls
+    // provider transitively. Pick ring once before any TLS connection, otherwise Rustls 0.23
+    // panics when the operator asks to read a BMC's self-signed certificate fingerprint.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install Rustls ring crypto provider");
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
