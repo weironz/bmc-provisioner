@@ -97,6 +97,7 @@ pub struct ProvisionPlan {
     pub account_uri: String,
     pub ethernet_interface_uri: String,
     pub current_password_change_required: bool,
+    pub password_change_requested: bool,
     pub target_network: StaticNetwork,
 }
 

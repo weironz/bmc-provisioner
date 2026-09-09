@@ -26,6 +26,8 @@ section { background: #fff; border: 1px solid #dbe5de; border-radius: 14px; box-
 .danger { background: #a33a26; }
 .fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 20px; }
 .fields.compact { grid-template-columns: minmax(0, 2fr) minmax(160px, 1fr); }
+.password-change-toggle { align-items: center; display: flex; font-size: .84rem; gap: 8px; padding-top: 25px; }
+.password-change-toggle input { width: auto; }
 label { color: #456157; display: grid; font-size: .84rem; font-weight: 650; gap: 7px; }
 input, select { width: 100%; border: 1px solid #b9cfc3; border-radius: 7px; background: #fff; color: #17221e; padding: 9px 10px; }
 input:focus, select:focus { border-color: #0f766e; box-shadow: 0 0 0 3px #bde5d8; outline: none; }

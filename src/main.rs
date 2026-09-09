@@ -54,6 +54,7 @@ struct PlanRequest {
     target_network: StaticNetwork,
     ethernet_interface_uri: Option<String>,
     certificate_fingerprint: Option<String>,
+    password_change: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +268,7 @@ async fn plan(
         request.target_network,
         request.ethernet_interface_uri.as_deref(),
         request.certificate_fingerprint.as_deref(),
+        request.password_change.unwrap_or(false),
     )
     .await
     .map_err(workflow_api_error)?;

@@ -22,6 +22,7 @@ impl ProvisionWorkflow {
         target_network: StaticNetwork,
         requested_interface_uri: Option<&str>,
         certificate_fingerprint: Option<&str>,
+        password_change_requested: bool,
     ) -> Result<ProvisionPlan, WorkflowError> {
         target_network.validate()?;
         let client = RedfishClient::for_ipv4_with_fingerprint(
@@ -32,12 +33,15 @@ impl ProvisionWorkflow {
         let inventory = client.discover().await?;
         let interface =
             select_interface(&inventory, requested_interface_uri, source_ip, source_mac)?;
+        let password_change_requested =
+            password_change_requested || inventory.account.password_change_required;
         Ok(ProvisionPlan {
             source_ip,
             certificate_fingerprint: certificate_fingerprint.map(ToOwned::to_owned),
             account_uri: inventory.account.uri,
             ethernet_interface_uri: interface.uri,
             current_password_change_required: inventory.account.password_change_required,
+            password_change_requested,
             target_network,
         })
     }
@@ -64,12 +68,16 @@ impl ProvisionWorkflow {
             None,
         )?;
 
-        client
-            .change_password(&inventory.account, &credentials.new_password)
-            .await
-            .map_err(WorkflowError::PasswordChange)?;
-        let changed_password_client = client.with_password(credentials.new_password);
-        changed_password_client
+        let configured_client = if plan.password_change_requested {
+            client
+                .change_password(&inventory.account, &credentials.new_password)
+                .await
+                .map_err(WorkflowError::PasswordChange)?;
+            client.with_password(credentials.new_password)
+        } else {
+            client
+        };
+        configured_client
             .configure_static_ipv4(&interface.uri, &plan.target_network)
             .await
             .map_err(WorkflowError::NetworkConfiguration)?;
@@ -77,7 +85,7 @@ impl ProvisionWorkflow {
         // The password stays inside the authenticated client. Network changes can drop the
         // current connection immediately, so an unreachable target is a truthful non-success
         // outcome rather than a fabricated successful verification.
-        let verification_client = changed_password_client.at_ipv4(plan.target_network.address)?;
+        let verification_client = configured_client.at_ipv4(plan.target_network.address)?;
         let status = verify_after_network_change(&verification_client)
             .await
             .map_err(WorkflowError::NetworkVerification)?;

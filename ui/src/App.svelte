@@ -23,6 +23,7 @@
     accountUri: string;
     ethernetInterfaceUri: string;
     currentPasswordChangeRequired: boolean;
+    passwordChangeRequested: boolean;
     targetNetwork: { address: string; prefix: number; gateway: string };
   };
 
@@ -72,6 +73,7 @@
   let username = 'admin';
   let currentPassword = '';
   let newPassword = '';
+  let changePassword = false;
   let targetAddress = '';
   let targetPrefix = 24;
   let targetGateway = '';
@@ -296,7 +298,8 @@
           credentials: { username, currentPassword, newPassword },
           targetNetwork: { address: targetAddress, prefix: targetPrefix, gateway: targetGateway },
           ethernetInterfaceUri: interfaceUri || undefined,
-          certificateFingerprint: certificateConfirmed ? certificateFingerprint : undefined
+          certificateFingerprint: certificateConfirmed ? certificateFingerprint : undefined,
+          passwordChange: changePassword
         })
       });
       if (!response.ok) {
@@ -307,6 +310,7 @@
       const result = (await response.json()) as { planId: string; plan: Plan };
       planId = result.planId;
       plan = result.plan;
+      changePassword = result.plan.passwordChangeRequested;
       interfaceChoices = [];
       message = '计划已生成。请核对账户、管理网卡和目标地址，然后执行。';
     } catch (reason) {
@@ -412,7 +416,9 @@
         throw new Error(failure.error ?? '无法执行配置计划');
       }
       job = (await response.json()) as Job;
-      message = '已提交配置任务：正在改密、写入静态网络并验证新地址。';
+      message = plan?.passwordChangeRequested
+        ? '已提交配置任务：正在改密、写入静态网络并验证新地址。'
+        : '已提交配置任务：正在写入静态网络并验证新地址。';
       await pollJob();
     } catch (reason) {
       error = reason instanceof Error ? reason.message : '提交任务失败';
@@ -527,6 +533,7 @@
       <label>用户名 <input bind:value={username} autocomplete="username" /></label>
       <label>当前密码 <input bind:value={currentPassword} type="password" autocomplete="current-password" /></label>
       <label>新密码 <input bind:value={newPassword} type="password" autocomplete="new-password" /></label>
+      <label class="password-change-toggle"><input bind:checked={changePassword} type="checkbox" />此次配置同时修改 BMC 密码</label>
       <label>目标 IPv4 <input bind:value={targetAddress} inputmode="decimal" placeholder="192.168.10.20" /></label>
       <label>前缀 <input bind:value={targetPrefix} type="number" min="1" max="32" /></label>
       <label>网关 <input bind:value={targetGateway} inputmode="decimal" placeholder="192.168.10.1" /></label>
@@ -583,11 +590,12 @@
         <div><dt>当前 BMC IP</dt><dd>{plan.sourceIp}</dd></div>
         <div><dt>账户资源</dt><dd>{plan.accountUri}</dd></div>
         <div><dt>管理网卡</dt><dd>{plan.ethernetInterfaceUri}</dd></div>
-        <div><dt>强制改密</dt><dd>{plan.currentPasswordChangeRequired ? '是' : '否（仍将按输入的新密码修改）'}</dd></div>
+        <div><dt>首次强制改密</dt><dd>{plan.currentPasswordChangeRequired ? '是' : '否'}</dd></div>
+        <div><dt>本次改密</dt><dd>{plan.passwordChangeRequested ? '是' : '否，仅配置网络'}</dd></div>
         <div><dt>新网络</dt><dd>{plan.targetNetwork.address}/{plan.targetNetwork.prefix}，网关 {plan.targetNetwork.gateway}</dd></div>
       </dl>
       <button class="danger" onclick={applyPlan} disabled={applying}>
-        {applying ? '正在提交…' : '确认：修改密码并切换到静态 IP'}
+        {applying ? '正在提交…' : plan.passwordChangeRequested ? '确认：修改密码并切换到静态 IP' : '确认：切换到静态 IP'}
       </button>
     {:else}
       <p class="muted">生成计划后才会显示即将修改的 Redfish 资源。</p>
