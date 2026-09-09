@@ -25,6 +25,7 @@
   let editAddress = '';
   let loading = false;
   let executing = false;
+  let savingConnection = false;
   let message = '正在从 lessor 读取已确认 BMC。';
   let error = '';
   let progress = '';
@@ -79,6 +80,23 @@
     if (!response.ok) throw Error('无法读取本地 BMC 清单');
     managed = await response.json(); rebuildRows();
   }
+  async function saveConnection() {
+    savingConnection = true;
+    error = '';
+    try {
+      const response = await fetch(`${base}/api/v1/settings/defaults`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ lessorUrl, scopeId, username, targetPrefix, targetGateway }),
+      });
+      if (!response.ok) throw Error('无法保存全局 lessor 设置');
+      message = '已保存全局 lessor 连接设置。';
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '保存设置失败';
+    } finally {
+      savingConnection = false;
+    }
+  }
   async function refresh() {
     loading = true; error = '';
     try {
@@ -111,7 +129,7 @@
     if (!selected.length || !username || !currentPassword || !targetGateway || selected.some((row) => !targets[row.identity])) {
       error = '请勾选待配置 BMC，并填写共用凭据、网关及每台目标 IPv4。'; return;
     }
-    await fetch(`${base}/api/v1/settings/defaults`, { method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify({ lessorUrl, scopeId, username, targetPrefix, targetGateway }) });
+    await saveConnection();
     executing = true; error = '';
     const failed:string[] = [];
     for (const [index, row] of selected.entries()) {
@@ -161,11 +179,16 @@
 </script>
 
 <main>
-  <header><div><p class="eyebrow">BMC provisioning</p><h1>bmc-provisioner</h1></div><span class="local">仅本机 localhost</span></header>
+  <header><div><p class="eyebrow">Redfish BMC 工具</p><h1>bmc-provisioner</h1></div><span class="local">本机服务</span></header>
+  <section class="connection-settings">
+    <div><p class="step">全局连接</p><h2>lessor 设备发现</h2><p>此设置适用于全部 BMC 配置任务，并保存到本机。</p></div>
+    <div class="connection-fields"><label>lessor 地址<input bind:value={lessorUrl} placeholder="http://127.0.0.1:8080" /></label><label>作用域 ID<input bind:value={scopeId} type="number" min="1" /></label><button class="secondary" onclick={saveConnection} disabled={savingConnection}>{savingConnection ? '保存中…' : '保存连接设置'}</button></div>
+  </section>
   <p class="notice">lessor 负责动态发现；本地清单负责保存配置结果和历史。刷新会保留历史，并在填写凭据后实际更新在线、Redfish 与认证状态。</p>
   <section>
-    <div class="section-title"><div><p class="step">01</p><h2>BMC 配置清单与访问状态</h2></div><button onclick={refresh} disabled={loading || executing}>{loading ? (progress || '刷新中…') : '刷新并检查状态'}</button></div>
-    <div class="fields"><label>lessor 地址<input bind:value={lessorUrl} /></label><label>作用域 ID<input bind:value={scopeId} type="number" /></label><label>用户名<input bind:value={username} /></label><label>当前密码<input bind:value={currentPassword} type="password" /></label><label>新密码（首次强制改密时使用）<input bind:value={newPassword} type="password" /></label><label>前缀<input bind:value={targetPrefix} type="number" /></label><label>网关<input bind:value={targetGateway} placeholder="172.16.40.254" /></label></div>
+    <div class="section-title"><div><p class="step">01 · 清单</p><h2>BMC 配置清单与访问状态</h2></div><button onclick={refresh} disabled={loading || executing}>{loading ? (progress || '刷新中…') : '刷新并检查状态'}</button></div>
+    <div class="settings-group"><p>配置凭据</p><div class="fields credentials-fields"><label>用户名<input bind:value={username} /></label><label>当前密码<input bind:value={currentPassword} type="password" /></label><label>新密码 <small>仅首次强制改密</small><input bind:value={newPassword} type="password" /></label></div></div>
+    <div class="settings-group"><p>目标网络</p><div class="fields network-fields"><label>IPv4 前缀<input bind:value={targetPrefix} type="number" min="1" max="32" /></label><label>网关<input bind:value={targetGateway} placeholder="172.16.40.254" /></label></div></div>
     {#if rows.length}
       <div class="candidate-list merged-list"><div class="candidate header-row merged-row"><span>选择 / BMC</span><span>MAC / 作用域</span><span>目标静态 IPv4 / 访问</span><span>配置与访问状态</span></div>
       {#each rows as row}
