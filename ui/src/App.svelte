@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { openUrl } from '@tauri-apps/plugin-opener';
 
   // Vite and Tauri use a separate UI origin during development / desktop execution. Docker serves
   // this page from bmc-provisionerd itself, so same-origin keeps the browser-side API local.
@@ -177,6 +178,21 @@
       error = reason instanceof Error ? reason.message : '读取本机 BMC 清单失败';
     } finally {
       loadingManaged = false;
+    }
+  }
+
+  /// Open in the operator's normal browser, rather than asking the embedded WebView to create
+  /// another window. The browser fallback keeps the Docker/Vite UI useful outside Tauri.
+  async function openBmcAddress(address: string) {
+    const url = `https://${address}`;
+    try {
+      if ('__TAURI_INTERNALS__' in window) {
+        await openUrl(url);
+      } else {
+        window.open(url, '_blank', 'noopener,noreferrer');
+      }
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '无法使用默认浏览器打开 BMC 地址';
     }
   }
 
@@ -441,8 +457,12 @@
       return;
     }
     if (job.state === 'completed') {
+      // ProvisionWorkflow has already authenticated through the new address. Reload the
+      // durable record immediately so this run's online/Redfish/authentication state appears
+      // without requiring the operator to click the later health-check button.
+      await loadManagedBmcs();
       message = job.result?.status === 'completed'
-        ? `配置完成，已在 ${job.result.targetIp} 验证 Redfish 登录。`
+        ? `配置完成，已在 ${job.result.targetIp} 验证 Redfish 登录；清单与访问状态已自动刷新。`
         : '网络已写入，但暂未能通过新地址验证；请检查链路与目标网络。';
     } else {
       error = job.error ?? 'BMC 配置失败';
@@ -617,7 +637,7 @@
         {#each managedBmcs as bmc}
           <div class="inventory-row">
             <span><strong>{bmc.currentIp}</strong><small>{bmc.mac ?? bmc.identity} · {bmc.scopeName}</small></span>
-            <a href={`https://${bmc.currentIp}`} target="_blank" rel="noreferrer">https://{bmc.currentIp}</a>
+            <a href={`https://${bmc.currentIp}`} onclick={(event) => { event.preventDefault(); void openBmcAddress(bmc.currentIp); }}>https://{bmc.currentIp}</a>
             <span class:warning={bmc.configurationStatus !== 'completed'}>{stateLabel(bmc.configurationStatus)}</span>
             <span><i class:online={bmc.onlineStatus === 'online'}>{stateLabel(bmc.onlineStatus)}</i> / {stateLabel(bmc.redfishStatus)} / {stateLabel(bmc.authenticationStatus)}</span>
             <span>{formatTime(bmc.lastCheckedAt)}</span>

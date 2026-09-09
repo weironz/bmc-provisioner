@@ -144,6 +144,7 @@ fn spawn_service(state: &LocalService) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .manage(LocalService(Mutex::new(None)))
         .setup(|app| {
             if !service_is_up() {
