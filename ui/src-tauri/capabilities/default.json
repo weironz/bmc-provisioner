@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Desktop shell requires no frontend-to-native commands.",
+  "description": "Desktop shell may hand HTTPS BMC links to the operating system's default browser.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "opener:default"]
 }
