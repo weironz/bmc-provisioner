@@ -436,8 +436,39 @@ async fn ensure_success(response: Response) -> Result<Response, RedfishError> {
     } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         Err(RedfishError::AuthenticationFailed)
     } else {
-        Err(RedfishError::UnexpectedStatus(status))
+        // Redfish standard errors contain stable MessageId values such as
+        // `Base.1.17.PropertyNotWritable`. Keep only that identifier: it is useful for
+        // selecting a firmware-compatible write path, without retaining an arbitrary BMC
+        // response body (which may contain implementation-specific details).
+        let message_id = response
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|body| redfish_message_id(&body));
+        Err(RedfishError::UnexpectedStatus { status, message_id })
     }
+}
+
+fn redfish_message_id(body: &Value) -> Option<String> {
+    let error = body.get("error")?;
+    let candidates = error
+        .get("@Message.ExtendedInfo")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.get("MessageId"))
+        .chain(std::iter::once(error.get("code")));
+    candidates
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|value| {
+            !value.is_empty()
+                && value.len() <= 160
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+        })
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Error)]
@@ -462,8 +493,17 @@ pub enum RedfishError {
     Request(#[source] reqwest::Error),
     #[error("BMC authentication failed")]
     AuthenticationFailed,
-    #[error("Redfish returned HTTP {0}")]
-    UnexpectedStatus(StatusCode),
+    #[error(
+        "Redfish returned HTTP {status}{message_id}",
+        message_id = message_id
+            .as_deref()
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default()
+    )]
+    UnexpectedStatus {
+        status: StatusCode,
+        message_id: Option<String>,
+    },
     #[error("Redfish returned an unexpected response")]
     Decode(#[source] reqwest::Error),
     #[error("the Redfish account for {0:?} was not found")]
@@ -724,6 +764,34 @@ mod tests {
             "255.255.255.0"
         );
         assert_eq!(payload["IPv4StaticAddresses"][0]["Gateway"], "192.168.20.1");
+    }
+
+    #[test]
+    fn extracts_only_a_standard_redfish_message_id() {
+        let body = json!({
+            "error": {
+                "code": "Base.1.17.GeneralError",
+                "@Message.ExtendedInfo": [{
+                    "MessageId": "Base.1.17.PropertyNotWritable",
+                    "Message": "This text is deliberately not retained."
+                }]
+            }
+        });
+        assert_eq!(
+            redfish_message_id(&body).as_deref(),
+            Some("Base.1.17.PropertyNotWritable")
+        );
+    }
+
+    #[test]
+    fn ignores_nonstandard_redfish_error_text() {
+        let body = json!({
+            "error": {
+                "code": "arbitrary error response with whitespace",
+                "@Message.ExtendedInfo": [{ "MessageId": "also invalid!" }]
+            }
+        });
+        assert_eq!(redfish_message_id(&body), None);
     }
 
     #[test]

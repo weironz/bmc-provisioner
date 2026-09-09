@@ -157,7 +157,7 @@ struct JobRecord {
     id: Uuid,
     state: JobState,
     result: Option<ProvisionResult>,
-    error: Option<&'static str>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -426,6 +426,7 @@ async fn run_job(
     update_job(&state, job_id, JobState::Running, None, None).await;
     let target_network = plan.target_network.clone();
     let fingerprint = plan.certificate_fingerprint.clone();
+    let password_change_requested = plan.password_change_requested;
     match ProvisionWorkflow::apply(plan, credentials).await {
         Ok(result) => {
             if let Err(error) = state.inventory.record_provision(
@@ -442,13 +443,13 @@ async fn run_job(
         Err(error) => {
             // Do not persist raw BMC response bodies or credentials in a job record.
             tracing::warn!(error = %error, job_id = %job_id, "BMC provisioning job failed");
-            let safe_error = provisioning_failure_message(&error);
+            let safe_error = provisioning_failure_message(&error, password_change_requested);
             if let Err(store_error) = state.inventory.record_provision(
                 &candidate,
                 &target_network,
                 fingerprint.as_deref(),
                 None,
-                Some(safe_error),
+                Some(&safe_error),
             ) {
                 tracing::error!(error = %store_error, job_id = %job_id, "could not persist failed BMC inventory");
             }
@@ -458,19 +459,55 @@ async fn run_job(
     *state.active_job.lock().await = false;
 }
 
-fn provisioning_failure_message(error: &bmc_provisioner::workflow::WorkflowError) -> &'static str {
+fn provisioning_failure_message(
+    error: &bmc_provisioner::workflow::WorkflowError,
+    password_change_requested: bool,
+) -> String {
     use bmc_provisioner::workflow::WorkflowError;
     match error {
         WorkflowError::PasswordChange(_) => {
             "BMC rejected the password change; the network configuration was not attempted"
+                .to_owned()
         }
-        WorkflowError::NetworkConfiguration(_) => {
-            "password may have changed, but BMC rejected the static IPv4 configuration"
+        WorkflowError::NetworkConfiguration(redfish_error) => {
+            let password_notice = if password_change_requested {
+                "password may have changed; "
+            } else {
+                ""
+            };
+            format!(
+                "{password_notice}BMC rejected the static IPv4 configuration{}",
+                redfish_failure_context(redfish_error)
+            )
         }
         WorkflowError::NetworkVerification(_) => {
-            "password and network may have changed, but Redfish verification failed"
+            if password_change_requested {
+                "password and network may have changed, but Redfish verification failed".to_owned()
+            } else {
+                "network may have changed, but Redfish verification failed".to_owned()
+            }
         }
-        _ => "BMC provisioning failed before completion; inspect the plan and current BMC state",
+        _ => "BMC provisioning failed before completion; inspect the plan and current BMC state"
+            .to_owned(),
+    }
+}
+
+/// A Redfish MessageId is a fixed protocol identifier, unlike an arbitrary BMC error body.
+/// Show it to the operator because it distinguishes a non-writable property from a bad value
+/// without exposing credentials or vendor response text.
+fn redfish_failure_context(error: &bmc_provisioner::redfish::RedfishError) -> String {
+    use bmc_provisioner::redfish::RedfishError;
+
+    match error {
+        RedfishError::UnexpectedStatus {
+            status,
+            message_id: Some(message_id),
+        } => format!(" (HTTP {status}; {message_id})"),
+        RedfishError::UnexpectedStatus {
+            status,
+            message_id: None,
+        } => format!(" (HTTP {status})"),
+        _ => String::new(),
     }
 }
 
@@ -479,7 +516,7 @@ async fn update_job(
     job_id: Uuid,
     job_state: JobState,
     result: Option<ProvisionResult>,
-    error: Option<&'static str>,
+    error: Option<String>,
 ) {
     if let Some(job) = state.jobs.lock().await.get_mut(&job_id) {
         job.state = job_state;
