@@ -66,17 +66,21 @@ impl ProvisionWorkflow {
 
         client
             .change_password(&inventory.account, &credentials.new_password)
-            .await?;
+            .await
+            .map_err(WorkflowError::PasswordChange)?;
         let changed_password_client = client.with_password(credentials.new_password);
         changed_password_client
             .configure_static_ipv4(&interface.uri, &plan.target_network)
-            .await?;
+            .await
+            .map_err(WorkflowError::NetworkConfiguration)?;
 
         // The password stays inside the authenticated client. Network changes can drop the
         // current connection immediately, so an unreachable target is a truthful non-success
         // outcome rather than a fabricated successful verification.
         let verification_client = changed_password_client.at_ipv4(plan.target_network.address)?;
-        let status = verify_after_network_change(&verification_client).await?;
+        let status = verify_after_network_change(&verification_client)
+            .await
+            .map_err(WorkflowError::NetworkVerification)?;
 
         Ok(ProvisionResult {
             status,
@@ -92,7 +96,7 @@ impl ProvisionWorkflow {
 /// the authenticated Service Root read at a conservative 5-second cadence for at most one minute.
 async fn verify_after_network_change(
     client: &RedfishClient,
-) -> Result<ProvisionStatus, WorkflowError> {
+) -> Result<ProvisionStatus, RedfishError> {
     for attempt in 0..VERIFY_ATTEMPTS {
         match client.verify_connection().await {
             Ok(()) => return Ok(ProvisionStatus::Completed),
@@ -100,7 +104,7 @@ async fn verify_after_network_change(
                 sleep(VERIFY_INTERVAL).await;
             }
             Err(RedfishError::Request(_)) => return Ok(ProvisionStatus::NetworkChangedUnverified),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
     }
     Ok(ProvisionStatus::NetworkChangedUnverified)
@@ -168,6 +172,12 @@ fn normalize_mac(value: &str) -> String {
 pub enum WorkflowError {
     #[error(transparent)]
     Redfish(#[from] RedfishError),
+    #[error("BMC rejected the password-change operation")]
+    PasswordChange(#[source] RedfishError),
+    #[error("BMC rejected the static IPv4 configuration")]
+    NetworkConfiguration(#[source] RedfishError),
+    #[error("BMC network changed but Redfish verification failed")]
+    NetworkVerification(#[source] RedfishError),
     #[error(transparent)]
     InvalidNetwork(#[from] crate::model::NetworkValidationError),
     #[error("multiple BMC Ethernet interfaces were found; choose one explicitly: {0:?}")]

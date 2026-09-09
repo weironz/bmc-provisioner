@@ -440,26 +440,36 @@ async fn run_job(
         Err(error) => {
             // Do not persist raw BMC response bodies or credentials in a job record.
             tracing::warn!(error = %error, job_id = %job_id, "BMC provisioning job failed");
+            let safe_error = provisioning_failure_message(&error);
             if let Err(store_error) = state.inventory.record_provision(
                 &candidate,
                 &target_network,
                 fingerprint.as_deref(),
                 None,
-                Some("BMC rejected or did not support one of the requested changes"),
+                Some(safe_error),
             ) {
                 tracing::error!(error = %store_error, job_id = %job_id, "could not persist failed BMC inventory");
             }
-            update_job(
-                &state,
-                job_id,
-                JobState::Failed,
-                None,
-                Some("BMC rejected or did not support one of the requested changes"),
-            )
-            .await;
+            update_job(&state, job_id, JobState::Failed, None, Some(safe_error)).await;
         }
     }
     *state.active_job.lock().await = false;
+}
+
+fn provisioning_failure_message(error: &bmc_provisioner::workflow::WorkflowError) -> &'static str {
+    use bmc_provisioner::workflow::WorkflowError;
+    match error {
+        WorkflowError::PasswordChange(_) => {
+            "BMC rejected the password change; the network configuration was not attempted"
+        }
+        WorkflowError::NetworkConfiguration(_) => {
+            "password may have changed, but BMC rejected the static IPv4 configuration"
+        }
+        WorkflowError::NetworkVerification(_) => {
+            "password and network may have changed, but Redfish verification failed"
+        }
+        _ => "BMC provisioning failed before completion; inspect the plan and current BMC state",
+    }
 }
 
 async fn update_job(
