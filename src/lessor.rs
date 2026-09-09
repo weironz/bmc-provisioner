@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 use reqwest::Url;
@@ -45,14 +46,26 @@ impl LessorClient {
         }
         let body: Data<Vec<ScopeDevices>> = response.json().await.map_err(LessorError::Decode)?;
 
-        let mut candidates = Vec::new();
+        // A BMC can appear at both its previous static address and its current DHCP
+        // address while neighbor/discovery caches age out.  Collapse those rows by
+        // scope and MAC, preferring a live DHCP binding.  Older lessor releases did
+        // not include `currentAddress` in this endpoint, so it is only a fallback.
+        let mut selected: HashMap<(u64, String), (BmcCandidate, u8)> = HashMap::new();
         for scope in body.data {
             for device in scope.devices {
-                // A discovery cache can retain yesterday's BMC address after the same MAC gets
-                // a new DHCP lease. `currentAddress` prefers that active binding, but sensibly
-                // falls back to the newest confirmed discovery after a daemon restart.
-                if device.kind == "bmc" && device.confidence == "confirmed" && device.current_address {
-                    candidates.push(BmcCandidate {
+                if device.kind == "bmc" && device.confidence == "confirmed" {
+                    let rank = if device
+                        .lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.state == "bound")
+                    {
+                        3
+                    } else if device.current_address {
+                        2
+                    } else {
+                        1
+                    };
+                    let candidate = BmcCandidate {
                         scope_id: scope.scope.id,
                         scope_name: scope.scope.name.clone(),
                         subnet: scope.scope.subnet,
@@ -61,10 +74,31 @@ impl LessorClient {
                         mac: device.mac,
                         first_seen: device.first_seen,
                         last_seen: device.last_seen,
-                    });
+                    };
+                    let key = (
+                        scope.scope.id,
+                        candidate
+                            .mac
+                            .clone()
+                            .unwrap_or_else(|| candidate.ip.to_string()),
+                    );
+                    match selected.get(&key) {
+                        Some((existing, existing_rank))
+                            if *existing_rank > rank
+                                || (*existing_rank == rank
+                                    && existing.last_seen >= candidate.last_seen) => {}
+                        _ => {
+                            selected.insert(key, (candidate, rank));
+                        }
+                    }
                 }
             }
         }
+        let mut candidates: Vec<_> = selected
+            .into_values()
+            .map(|(candidate, _)| candidate)
+            .collect();
+        candidates.sort_by_key(|candidate| (candidate.scope_id, candidate.ip));
         Ok(candidates)
     }
 }
@@ -113,8 +147,14 @@ struct DeviceRecord {
     confidence: String,
     #[serde(default)]
     current_address: bool,
+    lease: Option<LeaseRecord>,
     first_seen: u64,
     last_seen: u64,
+}
+
+#[derive(Deserialize)]
+struct LeaseRecord {
+    state: String,
 }
 
 #[cfg(test)]
@@ -168,5 +208,28 @@ mod tests {
         assert_eq!(candidates[0].ip, Ipv4Addr::new(192, 168, 1, 10));
         assert_eq!(candidates[0].mac.as_deref(), Some("00:11:22:33:44:55"));
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_a_bound_lease_when_current_address_is_not_returned() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "scope": { "id": 1, "name": "Ethernet", "subnet": "172.16.40.0", "prefix": 24 },
+                    "devices": [
+                        { "ip": "172.16.40.100", "mac": "00:11:22:33:44:55", "kind": "bmc", "confidence": "confirmed", "lease": { "state": "bound" }, "firstSeen": 2, "lastSeen": 4 },
+                        { "ip": "172.16.40.200", "mac": "00:11:22:33:44:55", "kind": "bmc", "confidence": "confirmed", "firstSeen": 1, "lastSeen": 3 }
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LessorClient::new(Url::parse(&server.uri()).unwrap()).unwrap();
+        let candidates = client.confirmed_bmcs(Some(1)).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ip, Ipv4Addr::new(172, 16, 40, 100));
     }
 }
