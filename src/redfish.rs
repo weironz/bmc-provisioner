@@ -1,6 +1,9 @@
 use std::{net::Ipv4Addr, sync::Arc};
 
-use reqwest::{Response, StatusCode, Url};
+use reqwest::{
+    Response, StatusCode, Url,
+    header::{ETAG, HeaderValue, IF_MATCH},
+};
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -286,10 +289,15 @@ impl RedfishClient {
         network: &StaticNetwork,
     ) -> Result<(), RedfishError> {
         network.validate().map_err(RedfishError::InvalidNetwork)?;
-        self.send_json(
+        // Some compliant Redfish implementations (including AMI) reject PATCH without the
+        // ETag obtained from a preceding GET. Reading immediately before writing also protects
+        // us from overwriting a simultaneous operator change.
+        let etag = self.resource_etag(interface_uri).await?;
+        self.send_json_with_if_match(
             reqwest::Method::PATCH,
             interface_uri,
             static_ipv4_payload(network),
+            etag,
         )
         .await
     }
@@ -322,16 +330,50 @@ impl RedfishClient {
         resource: &str,
         body: Value,
     ) -> Result<(), RedfishError> {
+        self.send_json_with_if_match(method, resource, body, None)
+            .await
+    }
+
+    async fn send_json_with_if_match(
+        &self,
+        method: reqwest::Method,
+        resource: &str,
+        body: Value,
+        etag: Option<HeaderValue>,
+    ) -> Result<(), RedfishError> {
         let url = self.resource_url(resource)?;
-        let response = self
+        let mut request = self
             .client
             .request(method, url)
             .basic_auth(&self.username, Some(&self.password))
-            .json(&body)
+            .json(&body);
+        if let Some(etag) = etag {
+            request = request.header(IF_MATCH, etag);
+        }
+        let response = request.send().await.map_err(RedfishError::Request)?;
+        ensure_success(response).await.map(|_| ())
+    }
+
+    /// Get a resource's opaque entity tag. The ETag response header is canonical; the
+    /// `@odata.etag` property is a standards-defined fallback for firmware that omits it.
+    async fn resource_etag(&self, resource: &str) -> Result<Option<HeaderValue>, RedfishError> {
+        let url = self.resource_url(resource)?;
+        let response = self
+            .client
+            .get(url)
+            .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
             .map_err(RedfishError::Request)?;
-        ensure_success(response).await.map(|_| ())
+        let response = ensure_success(response).await?;
+        if let Some(etag) = response.headers().get(ETAG) {
+            return Ok(Some(etag.clone()));
+        }
+        let body: Value = response.json().await.map_err(RedfishError::Decode)?;
+        Ok(body
+            .get("@odata.etag")
+            .and_then(Value::as_str)
+            .and_then(|etag| HeaderValue::from_str(etag).ok()))
     }
 
     /// Restricts BMC-supplied `@odata.id` links to this BMC's HTTPS origin.
@@ -593,7 +635,7 @@ mod tests {
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{header, method, path},
     };
 
     fn credentials() -> Credentials {
@@ -672,9 +714,16 @@ mod tests {
                 interface,
             ),
         ] {
+            let response = if resource == "/redfish/v1/Managers/BMC/EthernetInterfaces/eth0" {
+                ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .insert_header("etag", "\"resource-version-1\"")
+            } else {
+                ResponseTemplate::new(200).set_body_json(body)
+            };
             Mock::given(method("GET"))
                 .and(path(resource))
-                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .respond_with(response)
                 .mount(server)
                 .await;
         }
@@ -692,6 +741,7 @@ mod tests {
             .await;
         Mock::given(method("PATCH"))
             .and(path("/redfish/v1/Managers/BMC/EthernetInterfaces/eth0"))
+            .and(header("if-match", "\"resource-version-1\""))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
