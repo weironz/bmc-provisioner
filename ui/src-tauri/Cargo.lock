@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "bmc-provisioner-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tauri",
  "tauri-build",

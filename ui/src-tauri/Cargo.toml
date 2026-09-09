@@ -1,6 +1,6 @@
 [package]
 name = "bmc-provisioner-desktop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Desktop shell for the local bmc-provisionerd service"
 license = "Apache-2.0"

@@ -28,7 +28,7 @@ services:
       start_period: 10s
 
   bmc-provisioner:
-    image: ${BMC_PROVISIONER_IMAGE:-ghcr.io/weironz/bmc-provisioner:0.1.0}
+    image: ${BMC_PROVISIONER_IMAGE:-ghcr.io/weironz/bmc-provisioner:v0.1.1}
     network_mode: host
     restart: unless-stopped
     depends_on:
