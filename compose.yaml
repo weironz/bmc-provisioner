@@ -4,7 +4,7 @@ name: bmc-provisioner
 # 两个 Web 管理界面都仅绑定宿主机 loopback；从办公网访问时请使用 VPN 或 SSH 隧道。
 services:
   lessord:
-    image: ${LESSOR_IMAGE:-willdockerhub/lessord:0.0.7}
+    image: ${LESSOR_IMAGE:-willdockerhub/lessord:0.0.8}
     network_mode: host
     restart: unless-stopped
     cap_drop: [ALL]
@@ -28,7 +28,7 @@ services:
       start_period: 10s
 
   bmc-provisioner:
-    image: ${BMC_PROVISIONER_IMAGE:-ghcr.io/weironz/bmc-provisioner:v0.1.1}
+    image: ${BMC_PROVISIONER_IMAGE:-ghcr.io/weironz/bmc-provisioner:v0.1.2}
     network_mode: host
     restart: unless-stopped
     depends_on:
