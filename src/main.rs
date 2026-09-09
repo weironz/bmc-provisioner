@@ -29,6 +29,11 @@ struct AppState {
     jobs: Mutex<HashMap<Uuid, JobRecord>>,
     active_job: Mutex<bool>,
     inventory: InventoryStore,
+    /// Docker often has neither Windows Credential Manager nor Linux Secret
+    /// Service.  When explicitly enabled, profile secrets stay in this process
+    /// only; SQLite still records only name and username.
+    session_credentials: bool,
+    session_profile_secrets: Mutex<HashMap<String, CredentialProfileSecret>>,
 }
 
 struct PlannedRecord {
@@ -223,6 +228,9 @@ async fn main() {
         jobs: Mutex::new(HashMap::new()),
         active_job: Mutex::new(false),
         inventory: InventoryStore::open_default().expect("open local BMC inventory"),
+        session_credentials: std::env::var("BMC_PROVISIONER_SESSION_CREDENTIALS")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")),
+        session_profile_secrets: Mutex::new(HashMap::new()),
     });
     let ui_directory =
         std::env::var("BMC_PROVISIONER_UI_DIR").unwrap_or_else(|_| "ui/dist".to_owned());
@@ -749,12 +757,7 @@ async fn load_credential_profile(
     if !exists {
         return Err(ApiError::not_found("credential profile was not found"));
     }
-    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(&name))
-        .map_err(credential_api_error)?;
-    let value = entry.get_password().map_err(credential_api_error)?;
-    serde_json::from_str(&value)
-        .map(Json)
-        .map_err(|_| ApiError::internal("stored credential profile is invalid"))
+    profile_secret(&state, &name).await.map(Json)
 }
 
 async fn save_credential_profile(
@@ -772,11 +775,7 @@ async fn save_credential_profile(
         current_password: request.current_password,
         new_password: request.new_password,
     };
-    let value = serde_json::to_string(&secret)
-        .map_err(|_| ApiError::unprocessable("could not encode credential profile"))?;
-    keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(&name))
-        .and_then(|entry| entry.set_password(&value))
-        .map_err(credential_api_error)?;
+    save_profile_secret(&state, &name, secret).await?;
     let mut profiles = state
         .inventory
         .credential_profiles()
@@ -820,15 +819,64 @@ async fn delete_credential_profile(
             "credential profile is still assigned to one or more BMC inventory records",
         ));
     }
-    keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(&name))
-        .and_then(|entry| entry.delete_credential())
-        .map_err(credential_api_error)?;
+    delete_profile_secret(&state, &name).await?;
     profiles.retain(|profile| profile.name != name);
     state
         .inventory
         .save_credential_profiles(&profiles)
         .map_err(inventory_api_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn profile_secret(state: &AppState, name: &str) -> Result<CredentialProfileSecret, ApiError> {
+    if state.session_credentials {
+        return state
+            .session_profile_secrets
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::not_found(
+                    "credential profile secret is not available in this service session; enter it again",
+                )
+            });
+    }
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(name))
+        .map_err(credential_api_error)?;
+    let value = entry.get_password().map_err(credential_api_error)?;
+    serde_json::from_str(&value)
+        .map_err(|_| ApiError::internal("stored credential profile is invalid"))
+}
+
+async fn save_profile_secret(
+    state: &AppState,
+    name: &str,
+    secret: CredentialProfileSecret,
+) -> Result<(), ApiError> {
+    if state.session_credentials {
+        state
+            .session_profile_secrets
+            .lock()
+            .await
+            .insert(name.to_owned(), secret);
+        return Ok(());
+    }
+    let value = serde_json::to_string(&secret)
+        .map_err(|_| ApiError::unprocessable("could not encode credential profile"))?;
+    keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(name))
+        .and_then(|entry| entry.set_password(&value))
+        .map_err(credential_api_error)
+}
+
+async fn delete_profile_secret(state: &AppState, name: &str) -> Result<(), ApiError> {
+    if state.session_credentials {
+        state.session_profile_secrets.lock().await.remove(name);
+        return Ok(());
+    }
+    keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(name))
+        .and_then(|entry| entry.delete_credential())
+        .map_err(credential_api_error)
 }
 
 fn valid_profile_name(name: &str) -> Result<String, ApiError> {

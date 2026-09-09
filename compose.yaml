@@ -42,6 +42,8 @@ services:
     environment:
       BMC_PROVISIONER_BIND: 127.0.0.1:6770
       LOCALAPPDATA: /var/lib/bmc-provisioner
+      # Docker 默认没有系统密钥链；密码仅保留在服务内存至容器重启。
+      BMC_PROVISIONER_SESSION_CREDENTIALS: "1"
 
 volumes:
   lessord-data:
