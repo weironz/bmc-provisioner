@@ -31,7 +31,7 @@ cargo run --bin bmc-provisionerd
 
 每次配置完成或失败后，BMC 的 MAC、源/目标地址、证书指纹、配置结果和最后检查状态会
 保存在本机 SQLite 清单中（Windows 默认位于 `%LOCALAPPDATA%\\bmc-provisioner\\inventory.sqlite3`）。
-密码不会写入该数据库；清单页的认证检查只使用当次输入的凭据。
+每行可关联一个凭据档案；SQLite 只保存档案名，用户名与密码保存在 Windows 凭据管理器。
 
 另开一个终端可启动开发界面：
 
@@ -50,12 +50,24 @@ bun run dev
 just app
 ```
 
-容器版本复用同一个 Rust 服务和前端构建产物：
+## IDC Docker Compose
 
-```powershell
-docker compose up --build
+`compose.yaml` 同时启动 `lessord` 与 bmc-provisioner，适合部署在**可路由到 BMC
+管理网的 Linux 主机**。lessord 使用 host 网络以接收 DHCP 广播；两个管理界面仅监听
+该主机的 `127.0.0.1`，从办公网访问应使用 VPN 或 SSH 隧道。
+
+```sh
+cp .env.example .env
+docker compose pull
+docker compose up -d
 ```
 
-容器端口只映射到主机 loopback，浏览器访问 `http://127.0.0.1:6770`。若 lessor 仍运行在
-Windows 主机，页面中的 lessor 地址应填写 `http://host.docker.internal:8080`，而不是
-`127.0.0.1`。
+首次启动后：
+
+1. 通过 `http://127.0.0.1:8080` 打开 lessor，选择网卡并创建 DHCP 作用域；
+2. 通过 `http://127.0.0.1:6770` 打开 bmc-provisioner；lessor 地址保持默认
+   `http://127.0.0.1:8080`；
+3. 在“凭据档案”创建 BMC 凭据，再在清单每行选择对应档案。
+
+这套 Compose 使用命名卷持久化 lessor 配置/租约和 bmc-provisioner 清单。不要将
+`docker compose down -v` 用于生产环境，它会删除这些卷。

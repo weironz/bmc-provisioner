@@ -1,0 +1,138 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验标签与应用版本一致
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          tauri_ver=$(grep -m1 '"version"' ui/src-tauri/tauri.conf.json | sed 's/.*: "\(.*\)".*/\1/')
+          test "$tag" = "$cargo_ver"
+          test "$tag" = "$tauri_ver"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: ui/package.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 前端检查与 Rust 测试
+        run: |
+          cd ui && bun install --frozen-lockfile && bun run check && bun run build
+          cd .. && cargo test
+
+  linux:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: ui/package.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建服务端与 Compose 包
+        shell: bash
+        run: |
+          cd ui && bun install --frozen-lockfile && bun run build
+          cd .. && cargo build --release --locked --bin bmc-provisionerd
+          v="${GITHUB_REF_NAME#v}"
+          mkdir -p out/cli out/compose
+          cp target/release/bmc-provisionerd out/cli/
+          tar -czf "out/bmc-provisioner-$v-x86_64-linux.tar.gz" -C out/cli bmc-provisionerd
+          cp compose.yaml .env.example README.md out/compose/
+          tar -czf "out/bmc-provisioner-compose-$v.tar.gz" -C out/compose compose.yaml .env.example README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: out/*.tar.gz
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: ui/package.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            ui/src-tauri
+      - name: 构建桌面端 sidecar 与安装包
+        shell: bash
+        run: |
+          cargo build --release --locked --bin bmc-provisionerd
+          mkdir -p ui/src-tauri/binaries
+          cp target/release/bmc-provisionerd.exe ui/src-tauri/binaries/bmc-provisionerd-x86_64-pc-windows-msvc.exe
+          cd ui
+          bun install --frozen-lockfile
+          bunx tauri build --bundles nsis
+      - name: 收集 Windows 产物
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item ui/src-tauri/target/release/bundle/nsis/*-setup.exe out/
+          Compress-Archive -Path target/release/bmc-provisionerd.exe -DestinationPath "out/bmc-provisioner-$version-x86_64-windows.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: out/*
+
+  image:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+
+  github-release:
+    needs: [linux, windows, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 校验发布产物
+        run: |
+          test -n "$(find dist -name '*x86_64-linux.tar.gz' -print -quit)"
+          test -n "$(find dist -name '*setup.exe' -print -quit)"
+          test -n "$(find dist -name '*x86_64-windows.zip' -print -quit)"
+          test -n "$(find dist -name '*compose-*.tar.gz' -print -quit)"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            ## BMC Provisioner ${{ github.ref_name }}
+
+            - Windows：下载 `*-setup.exe` 安装桌面端；
+            - Linux：下载 `*-x86_64-linux.tar.gz`；
+            - IDC 双服务部署：下载 `*-compose-*.tar.gz`，解压后按 README 启动。
+
+            Docker 镜像：`ghcr.io/${{ github.repository }}:${{ github.ref_name }}`。
+            Compose 同时运行 lessord 与 bmc-provisioner；lessord 使用 host 网络接收 DHCP 广播。

@@ -14,10 +14,12 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/bmc-provisioner
 COPY --from=service-build /src/target/release/bmc-provisionerd /usr/local/bin/bmc-provisionerd
 COPY --from=ui-build /src/ui/dist /app/ui
 ENV BMC_PROVISIONER_BIND=0.0.0.0:6770
 ENV BMC_PROVISIONER_UI_DIR=/app/ui
+ENV LOCALAPPDATA=/var/lib/bmc-provisioner
 EXPOSE 6770
 ENTRYPOINT ["/usr/local/bin/bmc-provisionerd"]

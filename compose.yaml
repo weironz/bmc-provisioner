@@ -1,8 +1,48 @@
+name: bmc-provisioner
+
+# 部署在可达 BMC 管理网的 Linux 主机上：lessord 必须使用 host 网络接收 DHCP 广播。
+# 两个 Web 管理界面都仅绑定宿主机 loopback；从办公网访问时请使用 VPN 或 SSH 隧道。
 services:
+  lessord:
+    image: ${LESSOR_IMAGE:-willdockerhub/lessord:0.0.7}
+    network_mode: host
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - lessord-data:/var/lib/lessord
+    command:
+      - --config=/var/lib/lessord/lessor.json
+      - --lease-db=/var/lib/lessord/leases.db
+      - --http=127.0.0.1:8080
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/lessord", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   bmc-provisioner:
-    build: .
-    image: bmc-provisioner:dev
-    ports:
-      - "127.0.0.1:6770:6770"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    image: ${BMC_PROVISIONER_IMAGE:-ghcr.io/weironz/bmc-provisioner:0.1.0}
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      lessord:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - bmc-provisioner-data:/var/lib/bmc-provisioner
+    environment:
+      BMC_PROVISIONER_BIND: 127.0.0.1:6770
+      LOCALAPPDATA: /var/lib/bmc-provisioner
+
+volumes:
+  lessord-data:
+  bmc-provisioner-data:
