@@ -45,6 +45,14 @@ input:focus, select:focus { border-color: #0f766e; box-shadow: 0 0 0 3px #bde5d8
 .diagnostic-result { margin-top: 18px; }
 .interface-choice { max-width: 620px; margin-bottom: 18px; }
 .certificate { display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid #dce8e1; border-radius: 8px; background: #f7fbf8; margin: 0 0 12px; padding: 12px; }
+.defaults-panel { border: 1px solid #dce8e1; border-radius: 8px; background: #f7fbf8; margin: 0 0 14px; padding: 12px; }
+.defaults-panel strong { color: #28544a; }
+.defaults-panel p { color: #5f746a; font-size: .84rem; line-height: 1.45; margin-top: 3px; }
+.save-credentials { align-items: center; display: flex; font-size: .82rem; gap: 8px; margin-top: 12px; }
+.save-credentials input { width: auto; }
+.defaults-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 12px; }
+.defaults-actions button { border: 1px solid #0f766e; border-radius: 7px; background: #0f766e; color: #fff; font-weight: 700; padding: 8px 10px; }
+.defaults-actions button.secondary { background: #fff; color: #0f766e; }
 .certificate strong { color: #28544a; }
 .certificate p { color: #5f746a; font-size: .84rem; line-height: 1.45; margin-top: 3px; }
 .certificate button { border: 1px solid #0f766e; border-radius: 7px; background: #fff; color: #0f766e; flex: 0 0 auto; font-weight: 700; padding: 8px 10px; }

@@ -7,7 +7,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{BmcCandidate, ProvisionResult, ProvisionStatus, StaticNetwork};
@@ -32,6 +32,30 @@ pub struct ManagedBmc {
     pub last_checked_at: Option<i64>,
     pub last_configured_at: Option<i64>,
     pub last_error: Option<String>,
+}
+
+/// Repeatable, non-secret values for provisioning. Passwords belong in the operating system
+/// credential vault and are intentionally not represented by this type or stored in SQLite.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisionDefaults {
+    pub lessor_url: String,
+    pub scope_id: u64,
+    pub username: String,
+    pub target_prefix: u8,
+    pub target_gateway: String,
+}
+
+impl Default for ProvisionDefaults {
+    fn default() -> Self {
+        Self {
+            lessor_url: "http://127.0.0.1:8080".to_owned(),
+            scope_id: 1,
+            username: "admin".to_owned(),
+            target_prefix: 24,
+            target_gateway: String::new(),
+        }
+    }
 }
 
 pub struct InventoryStore {
@@ -71,12 +95,45 @@ impl InventoryStore {
                     last_configured_at INTEGER,
                     last_error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS application_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL
+                );
                 ",
             )
             .map_err(StoreError::Database)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    pub fn load_defaults(&self) -> Result<ProvisionDefaults, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT setting_value FROM application_settings WHERE setting_key = 'provision_defaults'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Database)?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::SettingsDecode))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    }
+
+    pub fn save_defaults(&self, defaults: &ProvisionDefaults) -> Result<(), StoreError> {
+        let value = serde_json::to_string(defaults).map_err(StoreError::SettingsEncode)?;
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        connection
+            .execute(
+                "INSERT INTO application_settings (setting_key, setting_value) VALUES ('provision_defaults', ?1)
+                 ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                [value],
+            )
+            .map_err(StoreError::Database)?;
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<ManagedBmc>, StoreError> {
@@ -260,6 +317,10 @@ pub enum StoreError {
     NoDataDirectory,
     #[error("managed BMC record was not found")]
     MissingRecord,
+    #[error("could not encode provisioning defaults")]
+    SettingsEncode(#[source] serde_json::Error),
+    #[error("stored provisioning defaults are invalid")]
+    SettingsDecode(#[source] serde_json::Error),
 }
 
 #[cfg(test)]

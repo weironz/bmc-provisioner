@@ -28,11 +28,15 @@ pub struct AccountResource {
     pub change_password_action: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EthernetInterface {
     pub uri: String,
     pub id: String,
     pub name: Option<String>,
+    pub mac_address: Option<String>,
+    pub ipv4_addresses: Vec<Ipv4Addr>,
+    pub link_status: Option<String>,
 }
 
 /// SHA-256 fingerprint of the leaf certificate currently served by a BMC.
@@ -229,6 +233,13 @@ impl RedfishClient {
                 uri: member.odata_id,
                 id: interface.id.unwrap_or_default(),
                 name: interface.name,
+                mac_address: interface.mac_address,
+                ipv4_addresses: interface
+                    .ipv4_addresses
+                    .into_iter()
+                    .filter_map(|address| address.address)
+                    .collect(),
+                link_status: interface.link_status,
             });
         }
         if ethernet_interfaces.is_empty() {
@@ -523,6 +534,18 @@ struct EthernetInterfaceResponse {
     id: Option<String>,
     #[serde(rename = "Name")]
     name: Option<String>,
+    #[serde(rename = "MACAddress")]
+    mac_address: Option<String>,
+    #[serde(rename = "IPv4Addresses", default)]
+    ipv4_addresses: Vec<Ipv4Address>,
+    #[serde(rename = "LinkStatus")]
+    link_status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Ipv4Address {
+    #[serde(rename = "Address")]
+    address: Option<Ipv4Addr>,
 }
 
 #[cfg(test)]
@@ -591,7 +614,10 @@ mod tests {
         let managers = json!({ "Members": [{ "@odata.id": "/redfish/v1/Managers/BMC" }] });
         let manager = json!({ "EthernetInterfaces": { "@odata.id": "/redfish/v1/Managers/BMC/EthernetInterfaces" } });
         let interfaces = json!({ "Members": [{ "@odata.id": "/redfish/v1/Managers/BMC/EthernetInterfaces/eth0" }] });
-        let interface = json!({ "Id": "eth0", "Name": "BMC management" });
+        let interface = json!({
+            "Id": "eth0", "Name": "BMC management", "MACAddress": "00:11:22:33:44:55",
+            "IPv4Addresses": [{ "Address": "192.168.1.10" }], "LinkStatus": "LinkUp"
+        });
 
         for (resource, body) in [
             ("/redfish/v1/", root),

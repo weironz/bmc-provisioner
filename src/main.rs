@@ -11,7 +11,7 @@ use bmc_provisioner::{
     lessor::LessorClient,
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
     redfish::{CertificateFingerprint, EthernetInterface, RedfishClient, probe_certificate},
-    storage::{InventoryStore, ManagedBmc},
+    storage::{InventoryStore, ManagedBmc, ProvisionDefaults},
     workflow::ProvisionWorkflow,
 };
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,23 @@ struct ManagedHealthCheckRequest {
     current_password: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCredentials {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DefaultsResponse {
+    defaults: ProvisionDefaults,
+    has_stored_credentials: bool,
+}
+
+const CREDENTIAL_SERVICE: &str = "io.bmc-provisioner.desktop";
+const CREDENTIAL_ACCOUNT: &str = "provision-defaults";
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JobRecord {
@@ -195,6 +212,14 @@ async fn main() {
             "/api/v1/managed-bmcs/{identity}/check",
             post(check_managed_bmc),
         )
+        .route(
+            "/api/v1/settings/defaults",
+            get(load_defaults).put(save_defaults),
+        )
+        .route(
+            "/api/v1/settings/credentials",
+            get(load_credentials).post(save_credentials),
+        )
         // The service itself only listens on loopback. This permits the Vite development UI to
         // call it from a different loopback port; the packaged desktop UI will be same-origin.
         .layer(CorsLayer::very_permissive())
@@ -237,6 +262,7 @@ async fn plan(
 
     let provision_plan = ProvisionWorkflow::plan(
         candidate.ip,
+        candidate.mac.as_deref(),
         &request.credentials,
         request.target_network,
         request.ethernet_interface_uri.as_deref(),
@@ -473,6 +499,59 @@ async fn list_managed_bmcs(
     })
 }
 
+async fn load_defaults(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DefaultsResponse>, ApiError> {
+    let defaults = state
+        .inventory
+        .load_defaults()
+        .map_err(inventory_api_error)?;
+    Ok(Json(DefaultsResponse {
+        defaults,
+        has_stored_credentials: stored_credentials()
+            .map_err(credential_api_error)?
+            .is_some(),
+    }))
+}
+
+async fn save_defaults(
+    State(state): State<Arc<AppState>>,
+    Json(defaults): Json<ProvisionDefaults>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .inventory
+        .save_defaults(&defaults)
+        .map_err(inventory_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn load_credentials() -> Result<Json<StoredCredentials>, ApiError> {
+    stored_credentials()
+        .map_err(credential_api_error)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("no Windows Credential Manager entry was saved"))
+}
+
+async fn save_credentials(
+    Json(credentials): Json<StoredCredentials>,
+) -> Result<StatusCode, ApiError> {
+    let payload = serde_json::to_string(&credentials)
+        .map_err(|_| ApiError::unprocessable("could not encode credentials"))?;
+    keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
+        .and_then(|entry| entry.set_password(&payload))
+        .map_err(credential_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn stored_credentials() -> Result<Option<StoredCredentials>, keyring::Error> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)?;
+    match entry.get_password() {
+        Ok(value) => Ok(serde_json::from_str(&value).ok()),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Checks a persisted BMC without retaining the supplied credential. A TLS handshake establishes
 /// reachability first; authenticated Redfish discovery then distinguishes usable credentials.
 async fn check_managed_bmc(
@@ -539,7 +618,7 @@ fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiErr
     {
         return ApiError::unprocessable_with_details(
             "multiple BMC Ethernet interfaces were found; select one before applying",
-            serde_json::json!({ "ethernetInterfaceUris": interfaces }),
+            serde_json::json!({ "ethernetInterfaces": interfaces }),
         );
     }
     tracing::warn!(error = %error, "could not build BMC provisioning plan");
@@ -554,6 +633,11 @@ fn workflow_redfish_api_error(error: bmc_provisioner::redfish::RedfishError) -> 
 fn inventory_api_error(error: bmc_provisioner::storage::StoreError) -> ApiError {
     tracing::error!(error = %error, "local BMC inventory operation failed");
     ApiError::internal("could not update local BMC inventory")
+}
+
+fn credential_api_error(error: keyring::Error) -> ApiError {
+    tracing::warn!(error = %error, "Windows Credential Manager operation failed");
+    ApiError::unprocessable("could not access Windows Credential Manager")
 }
 
 struct ApiError {

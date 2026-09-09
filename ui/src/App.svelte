@@ -57,7 +57,8 @@
     lastError?: string;
   };
 
-  type ApiFailure = { error?: string; details?: { ethernetInterfaceUris?: string[] } };
+  type EthernetInterface = { uri: string; id: string; name?: string; macAddress?: string; ipv4Addresses: string[]; linkStatus?: string };
+  type ApiFailure = { error?: string; details?: { ethernetInterfaces?: EthernetInterface[] } };
 
   // lessord's HTTP API defaults to 8080. Port 6767 is its DHCP listener,
   // which intentionally does not serve the device-discovery API.
@@ -74,13 +75,15 @@
   let targetAddress = '';
   let targetPrefix = 24;
   let targetGateway = '';
+  let storeCredentials = false;
+  let hasStoredCredentials = false;
   let interfaceUri = '';
   let certificateFingerprint = '';
   let certificateConfirmed = false;
   let knownStaticFingerprint = '';
   let knownStaticFingerprintConfirmed = false;
   let staticDiagnostic: StaticDiagnostic | undefined;
-  let interfaceChoices: string[] = [];
+  let interfaceChoices: EthernetInterface[] = [];
   let plan: Plan | undefined;
   let planId = '';
   let job: Job | undefined;
@@ -92,13 +95,14 @@
   let diagnosingStatic = false;
   let loadingManaged = false;
   let checkingManagedIdentity = '';
+  let savingDefaults = false;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
   onDestroy(() => {
     if (pollTimer) clearTimeout(pollTimer);
   });
 
-  onMount(() => { void loadManagedBmcs(); });
+  onMount(() => { void Promise.all([loadManagedBmcs(), loadDefaults()]); });
 
   function clearPlan() {
     plan = undefined;
@@ -174,6 +178,65 @@
     }
   }
 
+  async function loadDefaults() {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/settings/defaults`);
+      if (!response.ok) return;
+      const result = (await response.json()) as {
+        defaults: { lessorUrl: string; scopeId: number; username: string; targetPrefix: number; targetGateway: string };
+        hasStoredCredentials: boolean;
+      };
+      lessorUrl = result.defaults.lessorUrl;
+      scopeId = result.defaults.scopeId;
+      username = result.defaults.username;
+      targetPrefix = result.defaults.targetPrefix;
+      targetGateway = result.defaults.targetGateway;
+      hasStoredCredentials = result.hasStoredCredentials;
+    } catch {
+      // The provisioning flow remains usable when defaults cannot be loaded.
+    }
+  }
+
+  async function saveDefaults() {
+    savingDefaults = true;
+    error = '';
+    try {
+      const defaultsResponse = await fetch(`${API_BASE}/api/v1/settings/defaults`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ lessorUrl, scopeId, username, targetPrefix, targetGateway })
+      });
+      if (!defaultsResponse.ok) throw new Error((await readFailure(defaultsResponse)).error ?? '无法保存默认配置');
+      if (storeCredentials) {
+        if (!currentPassword || !newPassword) throw new Error('保存凭据前请填写当前密码和新密码。');
+        const credentialResponse = await fetch(`${API_BASE}/api/v1/settings/credentials`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ currentPassword, newPassword })
+        });
+        if (!credentialResponse.ok) throw new Error((await readFailure(credentialResponse)).error ?? '无法保存 Windows 凭据');
+        hasStoredCredentials = true;
+      }
+      message = storeCredentials ? '默认配置已保存；密码已保存至 Windows 凭据管理器。' : '默认配置已保存；密码未保存。';
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '保存默认配置失败';
+    } finally {
+      savingDefaults = false;
+    }
+  }
+
+  async function loadStoredCredentials() {
+    error = '';
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/settings/credentials`);
+      if (!response.ok) throw new Error((await readFailure(response)).error ?? '未找到保存的 Windows 凭据');
+      const saved = (await response.json()) as { currentPassword: string; newPassword: string };
+      currentPassword = saved.currentPassword;
+      newPassword = saved.newPassword;
+      message = '已从 Windows 凭据管理器加载密码到本次会话。';
+    } catch (reason) {
+      error = reason instanceof Error ? reason.message : '加载 Windows 凭据失败';
+    }
+  }
+
   async function checkManagedBmc(bmc: ManagedBmc) {
     if (!username || !currentPassword) {
       error = '检查认证状态需要输入当前用户名和密码；凭据不会保存。';
@@ -209,6 +272,11 @@
     return seconds ? new Date(seconds * 1000).toLocaleString() : '未检查';
   }
 
+  function interfaceLabel(item: EthernetInterface) {
+    const addresses = item.ipv4Addresses.length ? item.ipv4Addresses.join(', ') : '无 IPv4 地址';
+    return `${item.name ?? item.id} · ${addresses}${item.macAddress ? ` · ${item.macAddress}` : ''}${item.linkStatus ? ` · ${item.linkStatus}` : ''}`;
+  }
+
   async function createPlan() {
     if (!selectedIp) {
       error = '请先选择 lessor 已确认的 BMC。';
@@ -233,7 +301,7 @@
       });
       if (!response.ok) {
         const failure = await readFailure(response);
-        interfaceChoices = failure.details?.ethernetInterfaceUris ?? [];
+        interfaceChoices = failure.details?.ethernetInterfaces ?? [];
         throw new Error(failure.error ?? 'BMC 无法生成配置计划');
       }
       const result = (await response.json()) as { planId: string; plan: Plan };
@@ -463,6 +531,20 @@
       <label>前缀 <input bind:value={targetPrefix} type="number" min="1" max="32" /></label>
       <label>网关 <input bind:value={targetGateway} inputmode="decimal" placeholder="192.168.10.1" /></label>
     </div>
+    <div class="defaults-panel">
+      <div>
+        <strong>默认配置</strong>
+        <p>用户名、lessor 地址、作用域、前缀和网关保存到本机 SQLite。每次只需填写本台 BMC 的目标 IPv4。</p>
+      </div>
+      <label class="save-credentials">
+        <input bind:checked={storeCredentials} type="checkbox" />
+        <span>同时将当前密码和新密码安全保存到 Windows 凭据管理器</span>
+      </label>
+      <div class="defaults-actions">
+        <button onclick={saveDefaults} disabled={savingDefaults}>{savingDefaults ? '正在保存…' : '保存默认配置'}</button>
+        {#if hasStoredCredentials}<button class="secondary" onclick={loadStoredCredentials}>加载保存的密码</button>{/if}
+      </div>
+    </div>
     <div class="certificate">
       <div>
         <strong>自签名 HTTPS 证书</strong>
@@ -477,10 +559,10 @@
       </label>
     {/if}
     {#if interfaceChoices.length > 0}
-      <label class="interface-choice">BMC 暴露多块管理网卡，请选择
+      <label class="interface-choice">未能从当前 DHCP 地址或 MAC 唯一识别管理网卡，请选择
         <select bind:value={interfaceUri}>
           <option value="">请选择 Redfish EthernetInterface</option>
-          {#each interfaceChoices as uri}<option value={uri}>{uri}</option>{/each}
+          {#each interfaceChoices as item}<option value={item.uri}>{interfaceLabel(item)}</option>{/each}
         </select>
       </label>
     {/if}

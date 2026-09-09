@@ -17,6 +17,7 @@ const VERIFY_INTERVAL: Duration = Duration::from_secs(5);
 impl ProvisionWorkflow {
     pub async fn plan(
         source_ip: Ipv4Addr,
+        source_mac: Option<&str>,
         credentials: &Credentials,
         target_network: StaticNetwork,
         requested_interface_uri: Option<&str>,
@@ -29,7 +30,8 @@ impl ProvisionWorkflow {
             certificate_fingerprint,
         )?;
         let inventory = client.discover().await?;
-        let interface = select_interface(&inventory, requested_interface_uri)?;
+        let interface =
+            select_interface(&inventory, requested_interface_uri, source_ip, source_mac)?;
         Ok(ProvisionPlan {
             source_ip,
             certificate_fingerprint: certificate_fingerprint.map(ToOwned::to_owned),
@@ -55,7 +57,12 @@ impl ProvisionWorkflow {
                 "selected account no longer matches the plan",
             ));
         }
-        let interface = select_interface(&inventory, Some(&plan.ethernet_interface_uri))?;
+        let interface = select_interface(
+            &inventory,
+            Some(&plan.ethernet_interface_uri),
+            plan.source_ip,
+            None,
+        )?;
 
         client
             .change_password(&inventory.account, &credentials.new_password)
@@ -102,6 +109,8 @@ async fn verify_after_network_change(
 fn select_interface(
     inventory: &RedfishInventory,
     requested_interface_uri: Option<&str>,
+    source_ip: Ipv4Addr,
+    source_mac: Option<&str>,
 ) -> Result<EthernetInterface, WorkflowError> {
     if let Some(uri) = requested_interface_uri {
         return inventory
@@ -113,15 +122,46 @@ fn select_interface(
                 "selected EthernetInterface no longer matches the plan",
             ));
     }
+    let ip_matches: Vec<_> = inventory
+        .ethernet_interfaces
+        .iter()
+        .filter(|interface| interface.ipv4_addresses.contains(&source_ip))
+        .cloned()
+        .collect();
+    if let [interface] = ip_matches.as_slice() {
+        return Ok(interface.clone());
+    }
+    let normalized_mac = source_mac.map(normalize_mac);
+    let mac_matches: Vec<_> = inventory
+        .ethernet_interfaces
+        .iter()
+        .filter(|interface| {
+            normalized_mac.as_deref().is_some_and(|source| {
+                interface
+                    .mac_address
+                    .as_deref()
+                    .is_some_and(|mac| normalize_mac(mac) == source)
+            })
+        })
+        .cloned()
+        .collect();
+    if let [interface] = mac_matches.as_slice() {
+        return Ok(interface.clone());
+    }
     match inventory.ethernet_interfaces.as_slice() {
         [interface] => Ok(interface.clone()),
         interfaces => Err(WorkflowError::InterfaceSelectionRequired(
-            interfaces
-                .iter()
-                .map(|interface| interface.uri.clone())
-                .collect(),
+            interfaces.to_vec(),
         )),
     }
+}
+
+fn normalize_mac(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug, Error)]
@@ -131,7 +171,7 @@ pub enum WorkflowError {
     #[error(transparent)]
     InvalidNetwork(#[from] crate::model::NetworkValidationError),
     #[error("multiple BMC Ethernet interfaces were found; choose one explicitly: {0:?}")]
-    InterfaceSelectionRequired(Vec<String>),
+    InterfaceSelectionRequired(Vec<EthernetInterface>),
     #[error("the BMC changed since the plan was created: {0}")]
     PlanChanged(&'static str),
 }
