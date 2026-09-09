@@ -21,6 +21,7 @@ pub struct ManagedBmc {
     pub mac: Option<String>,
     pub scope_id: u64,
     pub scope_name: String,
+    pub credential_profile: String,
     pub source_ip: Ipv4Addr,
     pub current_ip: Ipv4Addr,
     pub target_network: StaticNetwork,
@@ -32,6 +33,14 @@ pub struct ManagedBmc {
     pub last_checked_at: Option<i64>,
     pub last_configured_at: Option<i64>,
     pub last_error: Option<String>,
+}
+
+/// Only a profile label and user name live in SQLite. Password material remains in the OS vault.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialProfileMeta {
+    pub name: String,
+    pub username: String,
 }
 
 /// Repeatable, non-secret values for provisioning. Passwords belong in the operating system
@@ -81,6 +90,7 @@ impl InventoryStore {
                     mac TEXT,
                     scope_id INTEGER NOT NULL,
                     scope_name TEXT NOT NULL,
+                    credential_profile TEXT NOT NULL DEFAULT 'default',
                     source_ip TEXT NOT NULL,
                     current_ip TEXT NOT NULL,
                     target_ip TEXT NOT NULL,
@@ -102,17 +112,34 @@ impl InventoryStore {
                 ",
             )
             .map_err(StoreError::Database)?;
+        ensure_managed_bmc_column(
+            &connection,
+            "credential_profile",
+            "TEXT NOT NULL DEFAULT 'default'",
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
     }
 
     pub fn load_defaults(&self) -> Result<ProvisionDefaults, StoreError> {
+        self.load_setting("provision_defaults")
+            .map(|value| value.unwrap_or_default())
+    }
+
+    pub fn save_defaults(&self, defaults: &ProvisionDefaults) -> Result<(), StoreError> {
+        self.save_setting("provision_defaults", defaults)
+    }
+
+    fn load_setting<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
         let value: Option<String> = connection
             .query_row(
-                "SELECT setting_value FROM application_settings WHERE setting_key = 'provision_defaults'",
-                [],
+                "SELECT setting_value FROM application_settings WHERE setting_key = ?1",
+                [key],
                 |row| row.get(0),
             )
             .optional()
@@ -120,27 +147,38 @@ impl InventoryStore {
         value
             .map(|value| serde_json::from_str(&value).map_err(StoreError::SettingsDecode))
             .transpose()
-            .map(|value| value.unwrap_or_default())
     }
 
-    pub fn save_defaults(&self, defaults: &ProvisionDefaults) -> Result<(), StoreError> {
-        let value = serde_json::to_string(defaults).map_err(StoreError::SettingsEncode)?;
+    fn save_setting<T: Serialize + ?Sized>(&self, key: &str, value: &T) -> Result<(), StoreError> {
+        let value = serde_json::to_string(value).map_err(StoreError::SettingsEncode)?;
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
         connection
             .execute(
-                "INSERT INTO application_settings (setting_key, setting_value) VALUES ('provision_defaults', ?1)
+                "INSERT INTO application_settings (setting_key, setting_value) VALUES (?1, ?2)
                  ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
-                [value],
+                params![key, value],
             )
             .map_err(StoreError::Database)?;
         Ok(())
+    }
+
+    pub fn credential_profiles(&self) -> Result<Vec<CredentialProfileMeta>, StoreError> {
+        self.load_setting("credential_profiles")
+            .map(|profiles| profiles.unwrap_or_default())
+    }
+
+    pub fn save_credential_profiles(
+        &self,
+        profiles: &[CredentialProfileMeta],
+    ) -> Result<(), StoreError> {
+        self.save_setting("credential_profiles", profiles)
     }
 
     pub fn list(&self) -> Result<Vec<ManagedBmc>, StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
         let mut statement = connection
             .prepare(
-                "SELECT identity, mac, scope_id, scope_name, source_ip, current_ip, target_ip,
+                "SELECT identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
                         target_prefix, target_gateway, certificate_fingerprint, configuration_status,
                         online_status, redfish_status, authentication_status, last_checked_at,
                         last_configured_at, last_error
@@ -158,7 +196,7 @@ impl InventoryStore {
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
         connection
             .query_row(
-                "SELECT identity, mac, scope_id, scope_name, source_ip, current_ip, target_ip,
+                "SELECT identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
                         target_prefix, target_gateway, certificate_fingerprint, configuration_status,
                         online_status, redfish_status, authentication_status, last_checked_at,
                         last_configured_at, last_error
@@ -175,6 +213,7 @@ impl InventoryStore {
         candidate: &BmcCandidate,
         network: &StaticNetwork,
         fingerprint: Option<&str>,
+        credential_profile: &str,
         result: Option<&ProvisionResult>,
         error: Option<&str>,
     ) -> Result<(), StoreError> {
@@ -201,13 +240,13 @@ impl InventoryStore {
         connection
             .execute(
                 "INSERT INTO managed_bmcs (
-                    identity, mac, scope_id, scope_name, source_ip, current_ip, target_ip,
+                    identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
                     target_prefix, target_gateway, certificate_fingerprint, configuration_status,
                     online_status, redfish_status, authentication_status, last_checked_at,
                     last_configured_at, last_error
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                 ON CONFLICT(identity) DO UPDATE SET
-                    mac=excluded.mac, scope_id=excluded.scope_id, scope_name=excluded.scope_name,
+                    mac=excluded.mac, scope_id=excluded.scope_id, scope_name=excluded.scope_name, credential_profile=excluded.credential_profile,
                     source_ip=excluded.source_ip, current_ip=excluded.current_ip, target_ip=excluded.target_ip,
                     target_prefix=excluded.target_prefix, target_gateway=excluded.target_gateway,
                     certificate_fingerprint=excluded.certificate_fingerprint,
@@ -216,7 +255,7 @@ impl InventoryStore {
                     last_checked_at=excluded.last_checked_at, last_configured_at=excluded.last_configured_at,
                     last_error=excluded.last_error",
                 params![
-                    identity, candidate.mac, candidate.scope_id, candidate.scope_name,
+                    identity, candidate.mac, candidate.scope_id, candidate.scope_name, credential_profile,
                     candidate.ip.to_string(), current_ip.to_string(), network.address.to_string(),
                     i64::from(network.prefix), network.gateway.to_string(), fingerprint,
                     configuration_status, online, redfish, authentication, now, now, error,
@@ -253,6 +292,25 @@ impl InventoryStore {
         self.find(identity)?.ok_or(StoreError::MissingRecord)
     }
 
+    pub fn set_credential_profile(
+        &self,
+        identity: &str,
+        credential_profile: &str,
+    ) -> Result<ManagedBmc, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute(
+                "UPDATE managed_bmcs SET credential_profile=?2 WHERE identity=?1",
+                params![identity, credential_profile],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        self.find(identity)?.ok_or(StoreError::MissingRecord)
+    }
+
     /// Add a known BMC to the local inventory without contacting it or changing its network.
     /// This is useful for preserving an operator-maintained record that was not discovered by
     /// the local lessor instance.
@@ -270,11 +328,11 @@ impl InventoryStore {
         connection
             .execute(
                 "INSERT INTO managed_bmcs (
-                    identity, mac, scope_id, scope_name, source_ip, current_ip, target_ip,
+                    identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
                     target_prefix, target_gateway, certificate_fingerprint, configuration_status,
                     online_status, redfish_status, authentication_status, last_checked_at,
                     last_configured_at, last_error
-                ) VALUES (?1, ?2, 0, ?3, ?4, ?4, ?4, 24, '0.0.0.0', NULL, 'manual',
+                ) VALUES (?1, ?2, 0, ?3, 'default', ?4, ?4, ?4, 24, '0.0.0.0', NULL, 'manual',
                           'unknown', 'unknown', 'unknown', NULL, ?5, NULL)
                 ON CONFLICT(identity) DO UPDATE SET
                     mac=excluded.mac, scope_name=excluded.scope_name, current_ip=excluded.current_ip",
@@ -331,21 +389,22 @@ fn row_to_managed_bmc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedBmc> {
         mac: row.get(1)?,
         scope_id: row.get::<_, i64>(2)? as u64,
         scope_name: row.get(3)?,
-        source_ip: parse_ip(4)?,
-        current_ip: parse_ip(5)?,
+        credential_profile: row.get(4)?,
+        source_ip: parse_ip(5)?,
+        current_ip: parse_ip(6)?,
         target_network: StaticNetwork {
-            address: parse_ip(6)?,
-            prefix: row.get::<_, i64>(7)? as u8,
-            gateway: parse_ip(8)?,
+            address: parse_ip(7)?,
+            prefix: row.get::<_, i64>(8)? as u8,
+            gateway: parse_ip(9)?,
         },
-        certificate_fingerprint: row.get(9)?,
-        configuration_status: row.get(10)?,
-        online_status: row.get(11)?,
-        redfish_status: row.get(12)?,
-        authentication_status: row.get(13)?,
-        last_checked_at: row.get(14)?,
-        last_configured_at: row.get(15)?,
-        last_error: row.get(16)?,
+        certificate_fingerprint: row.get(10)?,
+        configuration_status: row.get(11)?,
+        online_status: row.get(12)?,
+        redfish_status: row.get(13)?,
+        authentication_status: row.get(14)?,
+        last_checked_at: row.get(15)?,
+        last_configured_at: row.get(16)?,
+        last_error: row.get(17)?,
     })
 }
 
@@ -354,6 +413,30 @@ fn identity(candidate: &BmcCandidate) -> String {
         .mac
         .clone()
         .unwrap_or_else(|| format!("scope-{}-ip-{}", candidate.scope_id, candidate.ip))
+}
+
+fn ensure_managed_bmc_column(
+    connection: &Connection,
+    column: &str,
+    definition: &str,
+) -> Result<(), StoreError> {
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('managed_bmcs') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Database)?;
+    if exists.is_none() {
+        connection
+            .execute(
+                &format!("ALTER TABLE managed_bmcs ADD COLUMN {column} {definition}"),
+                [],
+            )
+            .map_err(StoreError::Database)?;
+    }
+    Ok(())
 }
 
 fn default_database_path() -> Result<PathBuf, StoreError> {
@@ -429,6 +512,7 @@ mod tests {
                 &candidate(),
                 &network,
                 Some("a certificate fingerprint"),
+                "default",
                 Some(&result),
                 None,
             )

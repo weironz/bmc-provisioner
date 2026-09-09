@@ -11,7 +11,7 @@ use bmc_provisioner::{
     lessor::LessorClient,
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
     redfish::{CertificateFingerprint, EthernetInterface, RedfishClient, probe_certificate},
-    storage::{InventoryStore, ManagedBmc, ProvisionDefaults},
+    storage::{CredentialProfileMeta, InventoryStore, ManagedBmc, ProvisionDefaults},
     workflow::ProvisionWorkflow,
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,7 @@ struct AppState {
 struct PlannedRecord {
     candidate: BmcCandidate,
     plan: ProvisionPlan,
+    credential_profile: String,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +56,7 @@ struct PlanRequest {
     ethernet_interface_uri: Option<String>,
     certificate_fingerprint: Option<String>,
     password_change: Option<bool>,
+    credential_profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -145,12 +147,30 @@ struct CreateManagedBmcRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateManagedBmcRequest {
-    current_ip: Ipv4Addr,
+    current_ip: Option<Ipv4Addr>,
+    credential_profile: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredCredentials {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialProfileSecret {
+    username: String,
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialProfileUpsert {
+    name: String,
+    username: String,
     current_password: String,
     new_password: String,
 }
@@ -164,6 +184,7 @@ struct DefaultsResponse {
 
 const CREDENTIAL_SERVICE: &str = "io.bmc-provisioner.desktop";
 const CREDENTIAL_ACCOUNT: &str = "provision-defaults";
+const CREDENTIAL_PROFILE_PREFIX: &str = "profile:";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -242,6 +263,14 @@ async fn main() {
             "/api/v1/settings/credentials",
             get(load_credentials).post(save_credentials),
         )
+        .route(
+            "/api/v1/credential-profiles",
+            get(list_credential_profiles).post(save_credential_profile),
+        )
+        .route(
+            "/api/v1/credential-profiles/{name}",
+            get(load_credential_profile).delete(delete_credential_profile),
+        )
         // The service itself only listens on loopback. This permits the Vite development UI to
         // call it from a different loopback port; the packaged desktop UI will be same-origin.
         .layer(CorsLayer::very_permissive())
@@ -299,6 +328,9 @@ async fn plan(
         PlannedRecord {
             candidate: candidate.clone(),
             plan: provision_plan.clone(),
+            credential_profile: request
+                .credential_profile
+                .unwrap_or_else(|| "default".to_owned()),
         },
     );
     Ok(Json(PlannedProvision {
@@ -432,6 +464,7 @@ async fn apply(
         job_id,
         planned.candidate,
         planned.plan,
+        planned.credential_profile,
         request.credentials,
     ));
     Ok((StatusCode::ACCEPTED, Json(queued)))
@@ -442,6 +475,7 @@ async fn run_job(
     job_id: Uuid,
     candidate: BmcCandidate,
     plan: ProvisionPlan,
+    credential_profile: String,
     credentials: Credentials,
 ) {
     update_job(&state, job_id, JobState::Running, None, None).await;
@@ -454,6 +488,7 @@ async fn run_job(
                 &candidate,
                 &target_network,
                 fingerprint.as_deref(),
+                &credential_profile,
                 Some(&result),
                 None,
             ) {
@@ -469,6 +504,7 @@ async fn run_job(
                 &candidate,
                 &target_network,
                 fingerprint.as_deref(),
+                &credential_profile,
                 None,
                 Some(&safe_error),
             ) {
@@ -592,11 +628,34 @@ async fn update_managed_bmc(
     Path(identity): Path<String>,
     Json(request): Json<UpdateManagedBmcRequest>,
 ) -> Result<Json<ManagedBmc>, ApiError> {
-    state
+    let mut managed = state
         .inventory
-        .update_address(&identity, request.current_ip)
-        .map(Json)
-        .map_err(inventory_api_error)
+        .find(&identity)
+        .map_err(inventory_api_error)?
+        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    if let Some(current_ip) = request.current_ip {
+        managed = state
+            .inventory
+            .update_address(&identity, current_ip)
+            .map_err(inventory_api_error)?;
+    }
+    if let Some(profile) = request.credential_profile {
+        let profile = valid_profile_name(&profile)?;
+        let exists = state
+            .inventory
+            .credential_profiles()
+            .map_err(inventory_api_error)?
+            .iter()
+            .any(|item| item.name == profile);
+        if !exists {
+            return Err(ApiError::bad_request("credential profile was not found"));
+        }
+        managed = state
+            .inventory
+            .set_credential_profile(&identity, &profile)
+            .map_err(inventory_api_error)?;
+    }
+    Ok(Json(managed))
 }
 
 /// Removes an operator's local history row and has no effect on the BMC itself.
@@ -662,6 +721,131 @@ fn stored_credentials() -> Result<Option<StoredCredentials>, keyring::Error> {
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+async fn list_credential_profiles(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<CredentialProfileMeta>>, ApiError> {
+    state
+        .inventory
+        .credential_profiles()
+        .map(Json)
+        .map_err(inventory_api_error)
+}
+
+async fn load_credential_profile(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CredentialProfileSecret>, ApiError> {
+    let name = valid_profile_name(&name)?;
+    let exists = state
+        .inventory
+        .credential_profiles()
+        .map_err(inventory_api_error)?
+        .iter()
+        .any(|profile| profile.name == name);
+    if !exists {
+        return Err(ApiError::not_found("credential profile was not found"));
+    }
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(&name))
+        .map_err(credential_api_error)?;
+    let value = entry.get_password().map_err(credential_api_error)?;
+    serde_json::from_str(&value)
+        .map(Json)
+        .map_err(|_| ApiError::internal("stored credential profile is invalid"))
+}
+
+async fn save_credential_profile(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CredentialProfileUpsert>,
+) -> Result<StatusCode, ApiError> {
+    let name = valid_profile_name(&request.name)?;
+    if request.username.trim().is_empty() || request.current_password.is_empty() {
+        return Err(ApiError::bad_request(
+            "profile username and current password are required",
+        ));
+    }
+    let secret = CredentialProfileSecret {
+        username: request.username.clone(),
+        current_password: request.current_password,
+        new_password: request.new_password,
+    };
+    let value = serde_json::to_string(&secret)
+        .map_err(|_| ApiError::unprocessable("could not encode credential profile"))?;
+    keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(&name))
+        .and_then(|entry| entry.set_password(&value))
+        .map_err(credential_api_error)?;
+    let mut profiles = state
+        .inventory
+        .credential_profiles()
+        .map_err(inventory_api_error)?;
+    if let Some(existing) = profiles.iter_mut().find(|profile| profile.name == name) {
+        existing.username = request.username;
+    } else {
+        profiles.push(CredentialProfileMeta {
+            name,
+            username: request.username,
+        });
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    state
+        .inventory
+        .save_credential_profiles(&profiles)
+        .map_err(inventory_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_credential_profile(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let name = valid_profile_name(&name)?;
+    let mut profiles = state
+        .inventory
+        .credential_profiles()
+        .map_err(inventory_api_error)?;
+    if !profiles.iter().any(|profile| profile.name == name) {
+        return Err(ApiError::not_found("credential profile was not found"));
+    }
+    let assigned = state
+        .inventory
+        .list()
+        .map_err(inventory_api_error)?
+        .iter()
+        .any(|bmc| bmc.credential_profile == name);
+    if assigned {
+        return Err(ApiError::conflict(
+            "credential profile is still assigned to one or more BMC inventory records",
+        ));
+    }
+    keyring::Entry::new(CREDENTIAL_SERVICE, &profile_account(&name))
+        .and_then(|entry| entry.delete_credential())
+        .map_err(credential_api_error)?;
+    profiles.retain(|profile| profile.name != name);
+    state
+        .inventory
+        .save_credential_profiles(&profiles)
+        .map_err(inventory_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn valid_profile_name(name: &str) -> Result<String, ApiError> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > 64
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(ApiError::bad_request(
+            "profile name must be 1-64 ASCII letters, numbers, dot, dash, or underscore",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn profile_account(name: &str) -> String {
+    format!("{CREDENTIAL_PROFILE_PREFIX}{name}")
 }
 
 /// Checks a persisted BMC without retaining the supplied credential. A TLS handshake establishes
