@@ -661,7 +661,12 @@ fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiErr
         ),
         other => {
             tracing::warn!(error = %other, "could not build BMC provisioning plan");
-            ApiError::unprocessable("BMC could not produce a supported provisioning plan")
+            ApiError::unprocessable_with_details(
+                "BMC could not produce a supported provisioning plan",
+                // `Display` for these typed errors contains only the local failure class or HTTP
+                // status; it never includes a password or an unbounded BMC response body.
+                serde_json::json!({ "reason": other.to_string() }),
+            )
         }
     }
 }

@@ -59,7 +59,7 @@
   };
 
   type EthernetInterface = { uri: string; id: string; name?: string; macAddress?: string; ipv4Addresses: string[]; linkStatus?: string };
-  type ApiFailure = { error?: string; details?: { ethernetInterfaces?: EthernetInterface[] } };
+  type ApiFailure = { error?: string; details?: { ethernetInterfaces?: EthernetInterface[]; reason?: string } };
 
   // lessord's HTTP API defaults to 8080. Port 6767 is its DHCP listener,
   // which intentionally does not serve the device-discovery API.
@@ -305,7 +305,7 @@
       if (!response.ok) {
         const failure = await readFailure(response);
         interfaceChoices = failure.details?.ethernetInterfaces ?? [];
-        throw new Error(failure.error ?? 'BMC 无法生成配置计划');
+        throw new Error(failure.details?.reason ?? failure.error ?? 'BMC 无法生成配置计划');
       }
       const result = (await response.json()) as { planId: string; plan: Plan };
       planId = result.planId;
