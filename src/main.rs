@@ -295,11 +295,11 @@ async fn candidates(
 ) -> Result<Json<Vec<BmcCandidate>>, ApiError> {
     let client = lessor_client(&query.lessor_url)?;
     let candidates = client
-        .confirmed_bmcs(query.scope_id)
+        .provisioning_candidates(query.scope_id)
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "could not list confirmed BMC candidates from lessor");
-            ApiError::bad_gateway("could not read confirmed BMC candidates from lessor")
+            tracing::warn!(error = %error, "could not list BMC candidates from lessor");
+            ApiError::bad_gateway("could not read BMC candidates from lessor")
         })?;
     Ok(Json(candidates))
 }
@@ -309,7 +309,7 @@ async fn plan(
     Json(request): Json<PlanRequest>,
 ) -> Result<Json<PlannedProvision>, ApiError> {
     let candidate =
-        confirmed_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
+        provisioning_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
 
     let provision_plan = ProvisionWorkflow::plan(
         candidate.ip,
@@ -344,7 +344,7 @@ async fn probe_bmc_certificate(
     Json(request): Json<CertificateProbeRequest>,
 ) -> Result<Json<CertificateProbeResponse>, ApiError> {
     let candidate =
-        confirmed_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
+        provisioning_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
     let fingerprint = probe_certificate(candidate.ip).await.map_err(|error| {
         tracing::warn!(error = %error, ip = %candidate.ip, "could not inspect BMC certificate");
         ApiError::unprocessable("could not read a usable HTTPS certificate from this BMC")
@@ -409,24 +409,24 @@ impl From<EthernetInterface> for ReadOnlyEthernetInterface {
     }
 }
 
-async fn confirmed_candidate(
+async fn provisioning_candidate(
     lessor_url: &str,
     scope_id: u64,
     candidate_ip: Ipv4Addr,
 ) -> Result<BmcCandidate, ApiError> {
     let client = lessor_client(lessor_url)?;
     let candidates = client
-        .confirmed_bmcs(Some(scope_id))
+        .provisioning_candidates(Some(scope_id))
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "could not validate BMC candidate with lessor");
-            ApiError::bad_gateway("could not validate the selected BMC with lessor")
+            ApiError::bad_gateway("could not validate the selected BMC candidate with lessor")
         })?;
     candidates
         .into_iter()
         .find(|candidate| candidate.ip == candidate_ip)
         .ok_or_else(|| {
-            ApiError::bad_request("candidateIp is not a currently confirmed BMC in this scope")
+            ApiError::bad_request("candidateIp is not an active BMC candidate in this scope")
         })
 }
 

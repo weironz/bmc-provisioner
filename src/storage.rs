@@ -487,6 +487,7 @@ mod tests {
             mac: Some("00:11:22:33:44:55".to_owned()),
             first_seen: 1,
             last_seen: 2,
+            source: crate::model::CandidateSource::ConfirmedDiscovery,
         }
     }
 

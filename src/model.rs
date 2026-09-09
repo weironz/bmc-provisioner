@@ -3,8 +3,22 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// A BMC reported by lessor after IPMI/RMCP confirmation.
+/// How this row entered the provisioning inventory.
+///
+/// A relay DHCP binding only says that a client with this MAC holds the address;
+/// the Redfish plan step still has to confirm it is a manageable BMC before any
+/// write is attempted.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CandidateSource {
+    ConfirmedDiscovery,
+    RelayDhcpLease,
+}
+
+/// A BMC confirmed by lessor discovery, or a Relay DHCP candidate pending
+/// Redfish confirmation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BmcCandidate {
     pub scope_id: u64,
     pub scope_name: String,
@@ -14,6 +28,7 @@ pub struct BmcCandidate {
     pub mac: Option<String>,
     pub first_seen: u64,
     pub last_seen: u64,
+    pub source: CandidateSource,
 }
 
 /// The desired static IPv4 configuration for the BMC management interface.

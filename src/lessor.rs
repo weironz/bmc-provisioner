@@ -5,7 +5,7 @@ use reqwest::Url;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::model::BmcCandidate;
+use crate::model::{BmcCandidate, CandidateSource};
 
 /// Client for the intentionally narrow, confirmed-BMC portion of lessor's API.
 #[derive(Clone)]
@@ -74,6 +74,7 @@ impl LessorClient {
                         mac: device.mac,
                         first_seen: device.first_seen,
                         last_seen: device.last_seen,
+                        source: CandidateSource::ConfirmedDiscovery,
                     };
                     let key = (
                         scope.scope.id,
@@ -100,6 +101,79 @@ impl LessorClient {
             .collect();
         candidates.sort_by_key(|candidate| (candidate.scope_id, candidate.ip));
         Ok(candidates)
+    }
+
+    /// Returns the inventory that can safely be offered for provisioning.
+    ///
+    /// Direct scopes contribute only IPMI/RMCP-confirmed BMCs.  Relay scopes
+    /// cannot be scanned from this host, so lessor additionally publishes their
+    /// active DHCP bindings as *unconfirmed* candidates.  A subsequent Redfish
+    /// certificate/plan request validates the endpoint before any mutation.
+    pub async fn provisioning_candidates(
+        &self,
+        scope_id: Option<u64>,
+    ) -> Result<Vec<BmcCandidate>, LessorError> {
+        let mut candidates = self.confirmed_bmcs(scope_id).await?;
+        let relay_candidates = match self.relay_lease_candidates(scope_id).await {
+            Ok(candidates) => candidates,
+            // Retain compatibility with lessor versions predating the relay
+            // contract: direct IPMI-confirmed discovery continues to work.
+            Err(LessorError::UnexpectedStatus(status))
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+
+        for candidate in relay_candidates {
+            let same_endpoint = candidates.iter().any(|existing| {
+                existing.scope_id == candidate.scope_id
+                    && (existing.ip == candidate.ip
+                        || (existing.mac.is_some() && existing.mac == candidate.mac))
+            });
+            if !same_endpoint {
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort_by_key(|candidate| (candidate.scope_id, candidate.ip));
+        Ok(candidates)
+    }
+
+    async fn relay_lease_candidates(
+        &self,
+        scope_id: Option<u64>,
+    ) -> Result<Vec<BmcCandidate>, LessorError> {
+        let url = self
+            .base_url
+            .join("api/v1/lease-candidates")
+            .map_err(LessorError::InvalidUrl)?;
+        let mut request = self.client.get(url);
+        if let Some(scope_id) = scope_id {
+            request = request.query(&[("scopeId", scope_id)]);
+        }
+        let response = request.send().await.map_err(LessorError::Request)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(LessorError::UnexpectedStatus(status));
+        }
+        let body: Data<Vec<RelayLeaseRecord>> =
+            response.json().await.map_err(LessorError::Decode)?;
+        Ok(body
+            .data
+            .into_iter()
+            .map(|lease| BmcCandidate {
+                scope_id: lease.scope.id,
+                scope_name: lease.scope.name,
+                subnet: lease.scope.subnet,
+                prefix: lease.scope.prefix,
+                ip: lease.ip,
+                mac: Some(lease.mac),
+                first_seen: lease.first_seen,
+                last_seen: lease.last_seen,
+                source: CandidateSource::RelayDhcpLease,
+            })
+            .collect())
     }
 }
 
@@ -155,6 +229,16 @@ struct DeviceRecord {
 #[derive(Deserialize)]
 struct LeaseRecord {
     state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayLeaseRecord {
+    scope: ScopeReference,
+    ip: Ipv4Addr,
+    mac: String,
+    first_seen: u64,
+    last_seen: u64,
 }
 
 #[cfg(test)]
@@ -231,5 +315,35 @@ mod tests {
         let candidates = client.confirmed_bmcs(Some(1)).await.unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].ip, Ipv4Addr::new(172, 16, 40, 100));
+    }
+
+    #[tokio::test]
+    async fn includes_relay_dhcp_bindings_as_redfish_pending_candidates() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/lease-candidates"))
+            .and(query_param("scopeId", "40"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "scope": { "id": 40, "name": "BMC relay", "subnet": "172.16.40.0", "prefix": 24 },
+                    "ip": "172.16.40.100", "mac": "00:11:22:33:44:55",
+                    "firstSeen": 1, "lastSeen": 2, "expiresAt": 9_999_999_999u64
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LessorClient::new(Url::parse(&server.uri()).unwrap()).unwrap();
+        let candidates = client.provisioning_candidates(Some(40)).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ip, Ipv4Addr::new(172, 16, 40, 100));
+        assert_eq!(candidates[0].source, CandidateSource::RelayDhcpLease);
+        server.verify().await;
     }
 }
