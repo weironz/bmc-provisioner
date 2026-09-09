@@ -679,9 +679,11 @@ async fn load_defaults(
         .map_err(inventory_api_error)?;
     Ok(Json(DefaultsResponse {
         defaults,
-        has_stored_credentials: stored_credentials()
-            .map_err(credential_api_error)?
-            .is_some(),
+        // A headless Docker deployment deliberately has no Windows Credential
+        // Manager (nor usually a Linux Secret Service).  Connection/network
+        // defaults live in SQLite and must remain readable there; the optional
+        // legacy credential indicator must not make the whole settings page fail.
+        has_stored_credentials: stored_credentials().ok().flatten().is_some(),
     }))
 }
 
