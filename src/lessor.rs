@@ -49,9 +49,9 @@ impl LessorClient {
         for scope in body.data {
             for device in scope.devices {
                 // A discovery cache can retain yesterday's BMC address after the same MAC gets
-                // a new DHCP lease. The provisioning path must use the active DHCP binding,
-                // not merely a historical IPMI/RMCP discovery record.
-                if device.kind == "bmc" && device.confidence == "confirmed" && device.active_lease {
+                // a new DHCP lease. `currentAddress` prefers that active binding, but sensibly
+                // falls back to the newest confirmed discovery after a daemon restart.
+                if device.kind == "bmc" && device.confidence == "confirmed" && device.current_address {
                     candidates.push(BmcCandidate {
                         scope_id: scope.scope.id,
                         scope_name: scope.scope.name.clone(),
@@ -112,7 +112,7 @@ struct DeviceRecord {
     kind: String,
     confidence: String,
     #[serde(default)]
-    active_lease: bool,
+    current_address: bool,
     first_seen: u64,
     last_seen: u64,
 }
@@ -151,8 +151,8 @@ mod tests {
                 "data": [{
                     "scope": { "id": 7, "name": "Ethernet", "subnet": "192.168.1.0", "prefix": 24 },
                     "devices": [
-                        { "ip": "192.168.1.10", "mac": "00:11:22:33:44:55", "kind": "bmc", "confidence": "confirmed", "activeLease": true, "firstSeen": 1, "lastSeen": 2 },
-                        { "ip": "192.168.1.9", "mac": "00:11:22:33:44:55", "kind": "bmc", "confidence": "confirmed", "activeLease": false, "firstSeen": 1, "lastSeen": 2 },
+                        { "ip": "192.168.1.10", "mac": "00:11:22:33:44:55", "kind": "bmc", "confidence": "confirmed", "currentAddress": true, "firstSeen": 1, "lastSeen": 2 },
+                        { "ip": "192.168.1.9", "mac": "00:11:22:33:44:55", "kind": "bmc", "confidence": "confirmed", "currentAddress": false, "firstSeen": 1, "lastSeen": 2 },
                         { "ip": "192.168.1.11", "mac": "00:11:22:33:44:56", "kind": "bmc", "confidence": "probable", "firstSeen": 1, "lastSeen": 2 },
                         { "ip": "192.168.1.12", "mac": null, "kind": "device", "confidence": "confirmed", "firstSeen": 1, "lastSeen": 2 }
                     ]
