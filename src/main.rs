@@ -614,15 +614,44 @@ fn lessor_client(lessor_url: &str) -> Result<LessorClient, ApiError> {
 }
 
 fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiError {
-    if let bmc_provisioner::workflow::WorkflowError::InterfaceSelectionRequired(interfaces) = error
-    {
-        return ApiError::unprocessable_with_details(
-            "multiple BMC Ethernet interfaces were found; select one before applying",
-            serde_json::json!({ "ethernetInterfaces": interfaces }),
-        );
+    use bmc_provisioner::{redfish::RedfishError, workflow::WorkflowError};
+
+    match error {
+        WorkflowError::InterfaceSelectionRequired(interfaces) => {
+            ApiError::unprocessable_with_details(
+                "multiple BMC Ethernet interfaces could not be distinguished; select one explicitly",
+                serde_json::json!({ "ethernetInterfaces": interfaces }),
+            )
+        }
+        WorkflowError::Redfish(RedfishError::AuthenticationFailed) => ApiError::unprocessable(
+            "BMC authentication failed; check the current username and password",
+        ),
+        WorkflowError::Redfish(RedfishError::AccountNotFound(_)) => ApiError::unprocessable(
+            "BMC accepted the connection but did not expose the selected Redfish account",
+        ),
+        WorkflowError::Redfish(RedfishError::NoManager) => {
+            ApiError::unprocessable("BMC Redfish did not expose a Manager resource")
+        }
+        WorkflowError::Redfish(RedfishError::NoEthernetInterfaces) => {
+            ApiError::unprocessable("BMC Redfish did not expose a configurable EthernetInterface")
+        }
+        WorkflowError::Redfish(RedfishError::Request(_)) => ApiError::unprocessable(
+            "could not reach or verify BMC HTTPS; read and confirm its certificate fingerprint",
+        ),
+        WorkflowError::Redfish(RedfishError::Decode(_)) => {
+            ApiError::unprocessable("BMC returned an unsupported Redfish resource format")
+        }
+        WorkflowError::InvalidNetwork(_) => {
+            ApiError::bad_request("target IPv4, prefix, or gateway is invalid")
+        }
+        WorkflowError::PlanChanged(_) => ApiError::unprocessable(
+            "BMC Redfish resources changed; refresh the plan and select the interface again",
+        ),
+        other => {
+            tracing::warn!(error = %other, "could not build BMC provisioning plan");
+            ApiError::unprocessable("BMC could not produce a supported provisioning plan")
+        }
     }
-    tracing::warn!(error = %error, "could not build BMC provisioning plan");
-    ApiError::unprocessable("BMC could not produce a supported provisioning plan")
 }
 
 fn workflow_redfish_api_error(error: bmc_provisioner::redfish::RedfishError) -> ApiError {
