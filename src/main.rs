@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use bmc_provisioner::{
     lessor::LessorClient,
@@ -134,6 +134,20 @@ struct ManagedHealthCheckRequest {
     current_password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateManagedBmcRequest {
+    current_ip: Ipv4Addr,
+    mac: Option<String>,
+    scope_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateManagedBmcRequest {
+    current_ip: Ipv4Addr,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredCredentials {
@@ -208,7 +222,14 @@ async fn main() {
         .route("/api/v1/provision/plan", post(plan))
         .route("/api/v1/provision/plans/{plan_id}/apply", post(apply))
         .route("/api/v1/jobs/{job_id}", get(job))
-        .route("/api/v1/managed-bmcs", get(list_managed_bmcs))
+        .route(
+            "/api/v1/managed-bmcs",
+            get(list_managed_bmcs).post(create_managed_bmc),
+        )
+        .route(
+            "/api/v1/managed-bmcs/{identity}",
+            patch(update_managed_bmc).delete(delete_managed_bmc),
+        )
         .route(
             "/api/v1/managed-bmcs/{identity}/check",
             post(check_managed_bmc),
@@ -548,6 +569,48 @@ async fn list_managed_bmcs(
     })
 }
 
+/// Adds an address to the local BMC inventory. This deliberately has no Redfish side effects.
+async fn create_managed_bmc(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateManagedBmcRequest>,
+) -> Result<(StatusCode, Json<ManagedBmc>), ApiError> {
+    let managed = state
+        .inventory
+        .add_manual(
+            request.current_ip,
+            request.mac.as_deref(),
+            request.scope_name.as_deref(),
+        )
+        .map_err(inventory_api_error)?;
+    Ok((StatusCode::CREATED, Json(managed)))
+}
+
+/// Updates the local access address only. Operators use this when an existing BMC was moved
+/// outside this tool; it does not reconfigure the controller.
+async fn update_managed_bmc(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+    Json(request): Json<UpdateManagedBmcRequest>,
+) -> Result<Json<ManagedBmc>, ApiError> {
+    state
+        .inventory
+        .update_address(&identity, request.current_ip)
+        .map(Json)
+        .map_err(inventory_api_error)
+}
+
+/// Removes an operator's local history row and has no effect on the BMC itself.
+async fn delete_managed_bmc(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .inventory
+        .delete(&identity)
+        .map_err(inventory_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn load_defaults(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DefaultsResponse>, ApiError> {
@@ -714,6 +777,9 @@ fn workflow_redfish_api_error(error: bmc_provisioner::redfish::RedfishError) -> 
 }
 
 fn inventory_api_error(error: bmc_provisioner::storage::StoreError) -> ApiError {
+    if matches!(error, bmc_provisioner::storage::StoreError::MissingRecord) {
+        return ApiError::not_found("managed BMC was not found");
+    }
     tracing::error!(error = %error, "local BMC inventory operation failed");
     ApiError::internal("could not update local BMC inventory")
 }

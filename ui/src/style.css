@@ -34,10 +34,18 @@ input:focus, select:focus { border-color: #0f766e; box-shadow: 0 0 0 3px #bde5d8
 .candidate-list { display: grid; gap: 7px; overflow-x: auto; }
 .candidate { align-items: center; display: grid; grid-template-columns: minmax(190px, 1.25fr) minmax(150px, 1fr) minmax(180px, 1fr) auto; gap: 12px; min-width: 760px; text-align: left; border: 1px solid #d8e4dc; border-radius: 8px; background: #fbfdfb; color: #1c3128; padding: 11px 13px; }
 .candidate:hover, .candidate.selected { border-color: #0f766e; background: #e5f5ef; }
+.candidate.frozen { background: #f1f6f2; border-color: #aec8b7; }
+.candidate.frozen:hover { border-color: #aec8b7; background: #f1f6f2; }
 .candidate span { color: #5f746a; font-size: .88rem; }
 .candidate span strong, .candidate span small { display: block; }
 .candidate small, .inventory-row small { color: #5f746a; font-size: .78rem; margin-top: 3px; }
 .candidate button, .inventory-row button { border: 1px solid #0f766e; border-radius: 7px; background: #fff; color: #0f766e; font-weight: 700; padding: 8px 10px; white-space: nowrap; }
+.candidate a { color: #0f766e; display: block; font-size: .8rem; margin-top: 5px; overflow-wrap: anywhere; }
+.row-actions { display: flex; gap: 7px; margin-top: 8px; }
+.row-actions .text-danger { border-color: #a33a26; color: #a33a26; }
+.manual-add { align-items: end; border-top: 1px solid #dfe9e2; display: grid; gap: 10px; grid-template-columns: minmax(140px, auto) minmax(190px, 1fr) minmax(150px, .75fr) auto; margin-top: 22px; padding-top: 18px; }
+.manual-add strong { color: #28544a; font-size: .9rem; }
+.secondary { border: 1px solid #0f766e; border-radius: 8px; background: #fff; color: #0f766e; font-weight: 700; padding: 10px 14px; white-space: nowrap; }
 .candidate.header-row, .inventory-row.table-heading { border: 0; background: transparent; color: #6d8177; font-size: .78rem; font-weight: 750; padding: 3px 8px; }
 .static-diagnostic { border-top: 1px solid #dfe9e2; margin-top: 20px; padding-top: 20px; }
 .static-diagnostic h3 { font-size: 1rem; margin: 3px 0; }
@@ -88,4 +96,5 @@ footer { color: #47665a; line-height: 1.55; margin: 22px 2px; }
   .inventory-row { grid-template-columns: 1fr; gap: 5px; min-width: 0; }
   .section-title { align-items: flex-start; flex-direction: column; }
   .certificate { align-items: flex-start; flex-direction: column; }
+  .manual-add { align-items: stretch; grid-template-columns: 1fr; }
 }

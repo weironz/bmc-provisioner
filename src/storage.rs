@@ -252,6 +252,72 @@ impl InventoryStore {
         drop(connection);
         self.find(identity)?.ok_or(StoreError::MissingRecord)
     }
+
+    /// Add a known BMC to the local inventory without contacting it or changing its network.
+    /// This is useful for preserving an operator-maintained record that was not discovered by
+    /// the local lessor instance.
+    pub fn add_manual(
+        &self,
+        current_ip: Ipv4Addr,
+        mac: Option<&str>,
+        scope_name: Option<&str>,
+    ) -> Result<ManagedBmc, StoreError> {
+        let identity = mac
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("manual-{current_ip}"));
+        let now = timestamp();
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        connection
+            .execute(
+                "INSERT INTO managed_bmcs (
+                    identity, mac, scope_id, scope_name, source_ip, current_ip, target_ip,
+                    target_prefix, target_gateway, certificate_fingerprint, configuration_status,
+                    online_status, redfish_status, authentication_status, last_checked_at,
+                    last_configured_at, last_error
+                ) VALUES (?1, ?2, 0, ?3, ?4, ?4, ?4, 24, '0.0.0.0', NULL, 'manual',
+                          'unknown', 'unknown', 'unknown', NULL, ?5, NULL)
+                ON CONFLICT(identity) DO UPDATE SET
+                    mac=excluded.mac, scope_name=excluded.scope_name, current_ip=excluded.current_ip",
+                params![identity, mac, scope_name.unwrap_or("手动添加"), current_ip.to_string(), now],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        self.find(&identity)?.ok_or(StoreError::MissingRecord)
+    }
+
+    /// Changes only the local inventory address. It never sends a Redfish request.
+    pub fn update_address(
+        &self,
+        identity: &str,
+        current_ip: Ipv4Addr,
+    ) -> Result<ManagedBmc, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute(
+                "UPDATE managed_bmcs SET current_ip=?2, online_status='unknown',
+                 redfish_status='unknown', authentication_status='unknown', last_checked_at=NULL
+                 WHERE identity=?1",
+                params![identity, current_ip.to_string()],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        self.find(identity)?.ok_or(StoreError::MissingRecord)
+    }
+
+    /// Deletes one local inventory entry. The BMC itself is untouched.
+    pub fn delete(&self, identity: &str) -> Result<(), StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute("DELETE FROM managed_bmcs WHERE identity=?1", [identity])
+            .map_err(StoreError::Database)?;
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        Ok(())
+    }
 }
 
 fn row_to_managed_bmc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedBmc> {
@@ -373,6 +439,31 @@ mod tests {
         assert_eq!(managed[0].identity, "00:11:22:33:44:55");
         assert_eq!(managed[0].current_ip, network.address);
         assert_eq!(managed[0].authentication_status, "success");
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn manually_added_bmc_can_be_updated_and_deleted_without_a_provisioning_record() {
+        let path = std::env::temp_dir().join(format!("bmc-provisioner-{}.sqlite3", Uuid::new_v4()));
+        let store = InventoryStore::open(&path).unwrap();
+        let created = store
+            .add_manual(
+                Ipv4Addr::new(172, 16, 40, 200),
+                Some("00:11:22:33:44:55"),
+                Some("机房 A"),
+            )
+            .unwrap();
+        assert_eq!(created.configuration_status, "manual");
+
+        let updated = store
+            .update_address(&created.identity, Ipv4Addr::new(172, 16, 40, 201))
+            .unwrap();
+        assert_eq!(updated.current_ip, Ipv4Addr::new(172, 16, 40, 201));
+        assert_eq!(updated.online_status, "unknown");
+
+        store.delete(&created.identity).unwrap();
+        assert!(store.list().unwrap().is_empty());
         drop(store);
         let _ = fs::remove_file(path);
     }
