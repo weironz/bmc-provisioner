@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-stop-local-service"
+description = "允许界面在安装更新前停止桌面壳自行拉起的 bmc-provisionerd。"
+commands.allow = ["stop_local_service"]

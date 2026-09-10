@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
+  import UpdateDialog from './lib/UpdateDialog.svelte';
 
   const base = window.location.port === '5173' ? 'http://127.0.0.1:6770' : window.location.origin;
   type Candidate = { scopeId:number; scopeName:string; subnet:string; prefix:number; ip:string; mac?:string; source:'confirmedDiscovery'|'relayDhcpLease' };
@@ -36,6 +37,7 @@
   let message = '正在从 lessor 读取已确认 BMC。';
   let error = '';
   let progress = '';
+  let showAbout = false;
 
   onMount(async () => { await defaults(); await Promise.all([load(), inventory(), loadProfiles()]); });
 
@@ -114,7 +116,7 @@
 </script>
 
 <main>
-  <header><div><h1>bmc-provisioner <small>v0.1</small></h1></div><span class="local">已连接</span></header>
+  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.4</button></h1></div><span class="local">已连接</span></header>
   <nav aria-label="主导航"><button class:active={tab==='inventory'} onclick={()=>tab='inventory'}>BMC 清单 <span>{rows.length}</span></button><button class:active={tab==='connection'} onclick={()=>tab='connection'}>连接设置</button><button class:active={tab==='profiles'} onclick={()=>tab='profiles'}>凭据档案 <span>{profiles.length}</span></button></nav>
 
   {#if tab==='inventory'}
@@ -127,4 +129,5 @@
     <section class="settings-page"><div class="section-title"><div><h2>凭据档案</h2><p>每个 BMC 行可选择不同档案。桌面端密码写入系统凭据管理器；Docker 部署只保留到服务重启，不会写入 SQLite。</p></div></div><div class="profile-form"><label>档案名称<input bind:value={profileName} placeholder="例如 default、rack-a"/></label><label>用户名<input bind:value={profileUsername} placeholder="root"/></label><label>当前密码<input bind:value={profileCurrentPassword} type="password"/></label><label>新密码 <small>首次强制改密时使用</small><input bind:value={profileNewPassword} type="password"/></label><button class="primary" onclick={saveProfile}>保存档案</button></div>{#if profiles.length}<div class="profile-list">{#each profiles as item}<div><span><strong>{item.name}</strong><small>{item.username} · 系统凭据管理器或当前服务会话</small></span><button class="text-danger" onclick={()=>removeProfile(item.name)}>删除</button></div>{/each}</div>{:else}<p class="muted">还没有凭据档案。先创建一个档案，再回到 BMC 清单逐行选择。</p>{/if}</section>
   {/if}
   <footer aria-live="polite">{#if error}<p class="error">{error}</p>{/if}<p>{message}</p></footer>
+  {#if showAbout}<UpdateDialog version="0.1.4" onclose={()=>showAbout=false}/>{/if}
 </main>

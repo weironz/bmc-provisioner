@@ -8,7 +8,8 @@ main { min-height: 100vh; }
 header { align-items: center; background: #fff; border-bottom: 1px solid #dce4eb; display: flex; justify-content: space-between; padding: 21px 32px; }
 h1, h2, p { margin: 0; }
 h1 { color: #101c2a; font-size: 1.55rem; letter-spacing: -.04em; }
-h1 small { color: #526f81; font: 500 .78rem ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: 0; margin-left: 10px; }
+.version { background: transparent; border: 0; color: #526f81; cursor: pointer; font: 500 .78rem ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: 0; margin-left: 10px; padding: 0; }
+.version:hover { color: #0f766e; text-decoration: underline; }
 h2 { font-size: 1.1rem; letter-spacing: -.02em; }
 .local { background: #eff9f2; border: 1px solid #87bd99; border-radius: 999px; color: #247348; font-size: .82rem; padding: 6px 12px; }
 nav { align-items: center; background: #fff; border-bottom: 1px solid #dce4eb; display: flex; gap: 5px; padding: 0 24px; }

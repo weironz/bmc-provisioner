@@ -142,9 +142,33 @@ fn spawn_service(state: &LocalService) -> Result<(), String> {
     Ok(())
 }
 
+/// 安装更新前仅停止桌面壳自己拉起的 sidecar。
+///
+/// 若 6770 端口是操作者独立启动的服务，占用它的进程不属于桌面端，不能为了
+/// 更新外壳而杀掉它。此时安装仍可继续，只是新 sidecar 会在下次重启该服务后生效。
+#[tauri::command]
+fn stop_local_service(state: tauri::State<'_, LocalService>) -> Result<bool, String> {
+    let mut child = state
+        .0
+        .lock()
+        .map_err(|_| "本地服务状态锁异常".to_owned())?;
+    let Some(process) = child.as_mut() else {
+        return Ok(false);
+    };
+    process
+        .kill()
+        .map_err(|error| format!("无法停止本机服务：{error}"))?;
+    let _ = process.wait();
+    *child = None;
+    Ok(true)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .invoke_handler(tauri::generate_handler![stop_local_service])
         .manage(LocalService(Mutex::new(None)))
         .setup(|app| {
             if !service_is_up() {

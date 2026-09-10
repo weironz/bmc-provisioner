@@ -1,5 +1,11 @@
 # bmc-provisioner
 
+## Windows 桌面端更新
+
+安装包安装后的桌面端可点击左上角版本号，检查新版本。更新包由 GitHub Release
+提供，客户端会先验证 Tauri 签名，再下载安装并重启。Docker 与 Linux 二进制不走
+桌面自动更新，仍按部署方式升级。
+
 面向现场首次配置单台 BMC 的桌面与容器化工具。它从 `lessor` 获取已确认的 BMC，
 或获取 DHCP Relay 作用域的活动租约候选；候选在执行前仍会由 Redfish 确认，再修改
 初始密码和 IPv4 网络配置。

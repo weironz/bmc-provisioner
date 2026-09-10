@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Desktop shell may hand HTTPS BMC links to the operating system's default browser.","local":true,"windows":["main"],"permissions":["core:default","opener:default"]}}
+{"default":{"identifier":"default","description":"桌面端可打开 BMC 链接，并在签名验证后检查、安装更新。","local":true,"windows":["main"],"permissions":["core:default","opener:default","updater:default","process:allow-restart","allow-stop-local-service"]}}

@@ -1,7 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Desktop shell may hand HTTPS BMC links to the operating system's default browser.",
+  "description": "桌面端可打开 BMC 链接，并在签名验证后检查、安装更新。",
   "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "updater:default",
+    "process:allow-restart",
+    "allow-stop-local-service"
+  ]
 }

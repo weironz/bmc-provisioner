@@ -19,8 +19,14 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           cargo_ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           tauri_ver=$(grep -m1 '"version"' ui/src-tauri/tauri.conf.json | sed 's/.*: "\(.*\)".*/\1/')
+          ui_ver=$(grep -m1 '"version"' ui/package.json | sed 's/.*: "\(.*\)".*/\1/')
           test "$tag" = "$cargo_ver"
           test "$tag" = "$tauri_ver"
+          test "$tag" = "$ui_ver"
+      - name: 校验更新公钥已配置
+        run: |
+          pubkey=$(grep -m1 '"pubkey"' ui/src-tauri/tauri.conf.json | sed 's/.*: "\(.*\)".*/\1/')
+          test -n "$pubkey" || { echo "::error::缺少 updater.pubkey"; exit 1; }
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: ui/package.json
@@ -71,9 +77,13 @@ jobs:
           workspaces: |
             .
             ui/src-tauri
-      - name: 构建桌面端 sidecar 与安装包
+      - name: 构建已签名的桌面端 sidecar 与安装包
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo "::error::缺少 TAURI_SIGNING_PRIVATE_KEY"; exit 1; }
           cargo build --release --locked --bin bmc-provisionerd
           mkdir -p ui/src-tauri/binaries
           cp target/release/bmc-provisionerd.exe ui/src-tauri/binaries/bmc-provisionerd-x86_64-pc-windows-msvc.exe
@@ -86,6 +96,7 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart('v')
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item ui/src-tauri/target/release/bundle/nsis/*-setup.exe out/
+          Copy-Item ui/src-tauri/target/release/bundle/nsis/*-setup.exe.sig out/
           Compress-Archive -Path target/release/bmc-provisionerd.exe -DestinationPath "out/bmc-provisioner-$version-x86_64-windows.zip"
       - uses: actions/upload-artifact@v4
         with:
@@ -123,8 +134,29 @@ jobs:
         run: |
           test -n "$(find dist -name '*x86_64-linux.tar.gz' -print -quit)"
           test -n "$(find dist -name '*setup.exe' -print -quit)"
+          test -n "$(find dist -name '*setup.exe.sig' -print -quit)"
           test -n "$(find dist -name '*x86_64-windows.zip' -print -quit)"
           test -n "$(find dist -name '*compose-*.tar.gz' -print -quit)"
+      - name: 生成桌面自动更新清单
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          setup=$(find dist -name '*-setup.exe' -print -quit)
+          signature=$(cat "${setup}.sig")
+          cat > dist/latest.json <<JSON
+          {
+            "version": "$version",
+            "notes": "bmc-provisioner ${GITHUB_REF_NAME}，变更见 GitHub Release。",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "$signature",
+                "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$(basename "$setup")"
+              }
+            }
+          }
+          JSON
+          python3 -c "import json; data=json.load(open('dist/latest.json')); assert data['platforms']['windows-x86_64']['signature']; print('latest.json ok')"
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
@@ -132,6 +164,7 @@ jobs:
             ## BMC Provisioner ${{ github.ref_name }}
 
             - Windows：下载 `*-setup.exe` 安装桌面端；
+              桌面端左上角版本号可检查、下载并验证签名后安装后续更新；
             - Linux：下载 `*-x86_64-linux.tar.gz`；
             - IDC 双服务部署：下载 `*-compose-*.tar.gz`，解压后按 README 启动。
 
