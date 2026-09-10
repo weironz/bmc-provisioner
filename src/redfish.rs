@@ -118,15 +118,22 @@ impl RedfishClient {
         fingerprint: Option<&str>,
     ) -> Result<Self, RedfishError> {
         let base_url = Url::parse(&format!("https://{ip}/")).map_err(RedfishError::InvalidUrl)?;
+        // BMC addresses are always contacted directly.  In a corporate environment reqwest
+        // inherits HTTP(S)_PROXY by default; sending RFC1918 Redfish traffic to that proxy makes
+        // a reachable BMC look like a TLS or authentication failure.
         let client = match fingerprint {
             Some(fingerprint) => {
                 let fingerprint = CertificateFingerprint::parse(fingerprint)?;
                 reqwest::Client::builder()
+                    .no_proxy()
                     .use_preconfigured_tls(pinned_tls_config(Some(fingerprint)))
                     .build()
                     .map_err(RedfishError::Client)?
             }
-            None => reqwest::Client::new(),
+            None => reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .map_err(RedfishError::Client)?,
         };
         Self::from_client(base_url, credentials, client)
     }
@@ -138,7 +145,11 @@ impl RedfishClient {
         if base_url.host_str().is_none() {
             return Err(RedfishError::MissingHost);
         }
-        Self::from_client(base_url, credentials, reqwest::Client::new())
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(RedfishError::Client)?;
+        Self::from_client(base_url, credentials, client)
     }
 
     #[cfg(test)]
