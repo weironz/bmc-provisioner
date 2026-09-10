@@ -7,7 +7,6 @@
   type Candidate = { scopeId:number; scopeName:string; subnet:string; prefix:number; ip:string; mac?:string; source:'confirmedDiscovery'|'relayDhcpLease' };
   type Managed = { identity:string; mac?:string; scopeId:number; scopeName:string; sourceIp:string; currentIp:string; credentialProfile:string; configurationStatus:string; onlineStatus:string; redfishStatus:string; authenticationStatus:string; lastCheckedAt?:number };
   type Profile = { name:string; username:string };
-  type Secret = { username:string; currentPassword:string; newPassword:string };
   type Row = { identity:string; candidate?:Candidate; managed?:Managed; sourceIp:string; address:string; mac?:string; scopeName:string; subnet?:string; prefix?:number; frozen:boolean };
 
   let tab:'inventory'|'connection'|'profiles' = 'inventory';
@@ -71,7 +70,6 @@
   }
   async function inventory() { const response=await fetch(`${base}/api/v1/managed-bmcs`); if (!response.ok) throw Error('无法读取本地 BMC 清单'); managed=await response.json(); rebuildRows(); }
   async function loadProfiles() { const response=await fetch(`${base}/api/v1/credential-profiles`); if (!response.ok) throw Error('无法读取凭据档案'); profiles=await response.json(); }
-  async function profile(name:string):Promise<Secret> { const response=await fetch(`${base}/api/v1/credential-profiles/${encodeURIComponent(name)}`), value=await json(response); if(!response.ok) throw Error(value.error ?? `无法读取凭据档案 ${name}`); return value; }
   async function refresh() {
     loading=true; error='';
     try {
@@ -79,7 +77,7 @@
       const checkable=managed.filter(item => item.credentialProfile && profiles.some(profile => profile.name === item.credentialProfile));
       if (!checkable.length) { message = managed.length ? '请先为清单中的 BMC 选择一个凭据档案。' : candidates.length ? `已读取 ${candidates.length} 台待配置 BMC。` : '当前没有 BMC。'; return; }
       const failed:string[]=[];
-      for (const [index,item] of checkable.entries()) { progress=`检查 ${index+1}/${checkable.length}：${item.currentIp}`; try { const credentials=await profile(item.credentialProfile); const response=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(item.identity)}/check`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:credentials.username,currentPassword:credentials.currentPassword})}); if(!response.ok) failed.push(item.currentIp); } catch { failed.push(item.currentIp); } }
+      for (const [index,item] of checkable.entries()) { progress=`检查 ${index+1}/${checkable.length}：${item.currentIp}`; try { const response=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(item.identity)}/check`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({credentialProfile:item.credentialProfile})}); if(!response.ok) failed.push(item.currentIp); } catch { failed.push(item.currentIp); } }
       await inventory(); message=failed.length ? `状态检查完成；${failed.join('、')} 未能完成检查。` : `已更新 ${checkable.length} 台 BMC 的在线、Redfish 与认证状态。`;
     } catch(reason) { error=reason instanceof Error ? reason.message : '刷新失败'; } finally { loading=false; progress=''; }
   }
@@ -91,10 +89,9 @@
     for(const [index,row] of selected.entries()) {
       const candidate=row.candidate!, profileName=profileByRow[row.identity]; progress=`${index+1}/${selected.length}：${candidate.ip} → ${targets[row.identity]}`;
       try {
-        const credentials=await profile(profileName);
         const certificate=await fetch(`${base}/api/v1/certificates/probe`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip})}), certificateValue:any=await json(certificate); if(!certificate.ok) throw Error(certificateValue.error ?? '无法读取 HTTPS 证书');
-        const plan=await fetch(`${base}/api/v1/provision/plan`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip,credentials,targetNetwork:{address:targets[row.identity],prefix:targetPrefix,gateway:targetGateway},certificateFingerprint:certificateValue.fingerprint.sha256,passwordChange:false,credentialProfile:profileName})}), planned:any=await json(plan); if(!plan.ok) throw Error(planned.details?.reason ?? planned.error ?? '无法生成内部配置');
-        const apply=await fetch(`${base}/api/v1/provision/plans/${planned.planId}/apply`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({credentials})}), submitted:any=await json(apply); if(!apply.ok) throw Error(submitted.error ?? '无法提交'); const completed=await wait(submitted); if(completed.state!=='completed') throw Error(completed.error ?? '配置失败');
+        const plan=await fetch(`${base}/api/v1/provision/plan`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip,targetNetwork:{address:targets[row.identity],prefix:targetPrefix,gateway:targetGateway},certificateFingerprint:certificateValue.fingerprint.sha256,passwordChange:false,credentialProfile:profileName})}), planned:any=await json(plan); if(!plan.ok) throw Error(planned.details?.reason ?? planned.error ?? '无法生成内部配置');
+        const apply=await fetch(`${base}/api/v1/provision/plans/${planned.planId}/apply`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})}), submitted:any=await json(apply); if(!apply.ok) throw Error(submitted.error ?? '无法提交'); const completed=await wait(submitted); if(completed.state!=='completed') throw Error(completed.error ?? '配置失败');
       } catch(reason) { failed.push(`${candidate.ip}：${reason instanceof Error ? reason.message : '失败'}`); }
     }
     await inventory(); executing=false; progress=''; message=`批量任务完成：成功 ${selected.length-failed.length} 台，失败 ${failed.length} 台。`; if(failed.length) error=failed.join('；');
@@ -116,7 +113,7 @@
 </script>
 
 <main>
-  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.4</button></h1></div><span class="local">已连接</span></header>
+  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.5</button></h1></div><span class="local">已连接</span></header>
   <nav aria-label="主导航"><button class:active={tab==='inventory'} onclick={()=>tab='inventory'}>BMC 清单 <span>{rows.length}</span></button><button class:active={tab==='connection'} onclick={()=>tab='connection'}>连接设置</button><button class:active={tab==='profiles'} onclick={()=>tab='profiles'}>凭据档案 <span>{profiles.length}</span></button></nav>
 
   {#if tab==='inventory'}

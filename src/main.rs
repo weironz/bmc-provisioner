@@ -56,7 +56,7 @@ struct PlanRequest {
     lessor_url: String,
     scope_id: u64,
     candidate_ip: Ipv4Addr,
-    credentials: Credentials,
+    credentials: Option<Credentials>,
     target_network: StaticNetwork,
     ethernet_interface_uri: Option<String>,
     certificate_fingerprint: Option<String>,
@@ -131,14 +131,15 @@ struct PlannedProvision {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplyRequest {
-    credentials: Credentials,
+    credentials: Option<Credentials>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagedHealthCheckRequest {
-    username: String,
-    current_password: String,
+    username: Option<String>,
+    current_password: Option<String>,
+    credential_profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -318,11 +319,18 @@ async fn plan(
 ) -> Result<Json<PlannedProvision>, ApiError> {
     let candidate =
         provisioning_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
+    let credential_profile = request
+        .credential_profile
+        .unwrap_or_else(|| "default".to_owned());
+    let credentials = match request.credentials {
+        Some(credentials) => credentials,
+        None => credentials_for_profile(state.as_ref(), &credential_profile).await?,
+    };
 
     let provision_plan = ProvisionWorkflow::plan(
         candidate.ip,
         candidate.mac.as_deref(),
-        &request.credentials,
+        &credentials,
         request.target_network,
         request.ethernet_interface_uri.as_deref(),
         request.certificate_fingerprint.as_deref(),
@@ -336,9 +344,7 @@ async fn plan(
         PlannedRecord {
             candidate: candidate.clone(),
             plan: provision_plan.clone(),
-            credential_profile: request
-                .credential_profile
-                .unwrap_or_else(|| "default".to_owned()),
+            credential_profile,
         },
     );
     Ok(Json(PlannedProvision {
@@ -455,6 +461,16 @@ async fn apply(
         .await
         .remove(&plan_id)
         .ok_or_else(|| ApiError::not_found("provisioning plan was not found or has expired"))?;
+    let credentials = match request.credentials {
+        Some(credentials) => credentials,
+        None => match credentials_for_profile(state.as_ref(), &planned.credential_profile).await {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                state.plans.lock().await.insert(plan_id, planned);
+                return Err(error);
+            }
+        },
+    };
     *active = true;
     drop(active);
 
@@ -473,7 +489,7 @@ async fn apply(
         planned.candidate,
         planned.plan,
         planned.credential_profile,
-        request.credentials,
+        credentials,
     ));
     Ok((StatusCode::ACCEPTED, Json(queued)))
 }
@@ -786,18 +802,17 @@ async fn list_credential_profiles(
 async fn load_credential_profile(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Result<Json<CredentialProfileSecret>, ApiError> {
+) -> Result<Json<CredentialProfileMeta>, ApiError> {
     let name = valid_profile_name(&name)?;
-    let exists = state
+    state
         .inventory
         .credential_profiles()
         .map_err(inventory_api_error)?
         .iter()
-        .any(|profile| profile.name == name);
-    if !exists {
-        return Err(ApiError::not_found("credential profile was not found"));
-    }
-    profile_secret(&state, &name).await.map(Json)
+        .find(|profile| profile.name == name)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("credential profile was not found"))
 }
 
 async fn save_credential_profile(
@@ -889,6 +904,17 @@ async fn profile_secret(state: &AppState, name: &str) -> Result<CredentialProfil
         .map_err(|_| ApiError::internal("stored credential profile is invalid"))
 }
 
+/// Resolves a named profile inside the service. Profile passwords must never be returned to a
+/// browser/API caller: remote Docker deployments may otherwise expose them over plain HTTP.
+async fn credentials_for_profile(state: &AppState, name: &str) -> Result<Credentials, ApiError> {
+    let secret = profile_secret(state, name).await?;
+    Ok(Credentials {
+        username: secret.username,
+        current_password: secret.current_password,
+        new_password: secret.new_password,
+    })
+}
+
 async fn save_profile_secret(
     state: &AppState,
     name: &str,
@@ -963,10 +989,24 @@ async fn check_managed_bmc(
             .map(Json)
             .map_err(inventory_api_error);
     }
-    let credentials = Credentials {
-        username: request.username,
-        current_password: request.current_password,
-        new_password: String::new(),
+    let credentials = match (request.username, request.current_password) {
+        (Some(username), Some(current_password)) => Credentials {
+            username,
+            current_password,
+            new_password: String::new(),
+        },
+        (None, None) => {
+            let profile = request
+                .credential_profile
+                .as_deref()
+                .unwrap_or(&managed.credential_profile);
+            credentials_for_profile(state.as_ref(), profile).await?
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "provide both current credentials or a credentialProfile",
+            ));
+        }
     };
     let client = RedfishClient::for_ipv4_with_fingerprint(
         managed.current_ip,
