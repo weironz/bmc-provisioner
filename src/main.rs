@@ -528,8 +528,49 @@ fn provisioning_failure_message(
     error: &bmc_provisioner::workflow::WorkflowError,
     password_change_requested: bool,
 ) -> String {
-    use bmc_provisioner::workflow::WorkflowError;
+    use bmc_provisioner::{redfish::RedfishError, workflow::WorkflowError};
     match error {
+        // A provisioning plan is generated from authenticated Redfish resources.  Do not turn
+        // failures before the write phase into a generic "provisioning failed" message: the
+        // operator needs to know whether it is safe to retry and which input must be corrected.
+        // These strings intentionally do not include account names, credentials, or BMC bodies.
+        WorkflowError::Redfish(RedfishError::AuthenticationFailed) => {
+            "BMC authentication failed before any change; check the current username and password"
+                .to_owned()
+        }
+        WorkflowError::Redfish(RedfishError::Request(_)) => {
+            "could not reach or verify BMC HTTPS before any change; confirm the BMC address and certificate fingerprint"
+                .to_owned()
+        }
+        WorkflowError::Redfish(RedfishError::AccountNotFound(_)) => {
+            "BMC accepted the connection but did not expose the selected Redfish account; no change was made"
+                .to_owned()
+        }
+        WorkflowError::Redfish(RedfishError::NoManager) => {
+            "BMC Redfish did not expose a Manager resource; no change was made".to_owned()
+        }
+        WorkflowError::Redfish(RedfishError::NoEthernetInterfaces) => {
+            "BMC Redfish did not expose a configurable EthernetInterface; no change was made"
+                .to_owned()
+        }
+        WorkflowError::Redfish(RedfishError::Decode(_)) => {
+            "BMC returned an unsupported Redfish resource format before any change".to_owned()
+        }
+        WorkflowError::Redfish(redfish_error @ RedfishError::UnexpectedStatus { .. }) => format!(
+            "BMC rejected the initial Redfish discovery before any change{}",
+            redfish_failure_context(redfish_error)
+        ),
+        WorkflowError::InterfaceSelectionRequired(_) => {
+            "BMC exposes multiple management interfaces; select the intended Redfish EthernetInterface before retrying"
+                .to_owned()
+        }
+        WorkflowError::PlanChanged(_) => {
+            "BMC Redfish resources changed after planning; refresh the BMC entry and retry"
+                .to_owned()
+        }
+        WorkflowError::InvalidNetwork(_) => {
+            "the target IPv4, prefix, or gateway is invalid; no change was made".to_owned()
+        }
         WorkflowError::PasswordChange(_) => {
             "BMC rejected the password change; the network configuration was not attempted"
                 .to_owned()
@@ -552,8 +593,7 @@ fn provisioning_failure_message(
                 "network may have changed, but Redfish verification failed".to_owned()
             }
         }
-        _ => "BMC provisioning failed before completion; inspect the plan and current BMC state"
-            .to_owned(),
+        _ => "BMC provisioning failed before completion; inspect the current BMC state".to_owned(),
     }
 }
 
