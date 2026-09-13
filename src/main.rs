@@ -18,10 +18,10 @@ use bmc_provisioner::{
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
     redfish::{CertificateFingerprint, EthernetInterface, RedfishClient, probe_certificate},
     storage::{CredentialProfileMeta, InventoryStore, ManagedBmc, ProvisionDefaults},
-    workflow::ProvisionWorkflow,
+    workflow::{ProvisionWorkflow, WorkflowProgress},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -33,13 +33,90 @@ use uuid::Uuid;
 struct AppState {
     plans: Mutex<HashMap<Uuid, PlannedRecord>>,
     jobs: Mutex<HashMap<Uuid, JobRecord>>,
-    active_job: Mutex<bool>,
+    provisioning_queue: Arc<ProvisioningQueue>,
     inventory: InventoryStore,
     /// Docker often has neither Windows Credential Manager nor Linux Secret
     /// Service.  When explicitly enabled, profile secrets stay in this process
     /// only; SQLite still records only name and username.
     session_credentials: bool,
     session_profile_secrets: Mutex<HashMap<String, CredentialProfileSecret>>,
+}
+
+/// Limits only the sensitive mutation phase (authentication, optional password change and
+/// static network write). Once the BMC accepts the static address, its slow independent
+/// reconnect verification no longer holds a slot and cannot block the next BMC.
+struct ProvisioningQueue {
+    state: Mutex<ProvisioningQueueState>,
+    changed: Notify,
+}
+
+struct ProvisioningQueueState {
+    running: usize,
+    limit: usize,
+}
+
+struct ProvisioningPermit {
+    queue: Arc<ProvisioningQueue>,
+    released: bool,
+}
+
+impl ProvisioningQueue {
+    fn new(limit: u8) -> Self {
+        Self {
+            state: Mutex::new(ProvisioningQueueState {
+                running: 0,
+                limit: usize::from(limit),
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn limit(&self) -> usize {
+        self.state.lock().await.limit
+    }
+
+    async fn set_limit(&self, limit: u8) {
+        self.state.lock().await.limit = usize::from(limit);
+        self.changed.notify_waiters();
+    }
+
+    async fn acquire(self: &Arc<Self>) -> (ProvisioningPermit, usize, usize) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut state = self.state.lock().await;
+            if state.running < state.limit {
+                state.running += 1;
+                let running = state.running;
+                let limit = state.limit;
+                drop(state);
+                return (
+                    ProvisioningPermit {
+                        queue: Arc::clone(self),
+                        released: false,
+                    },
+                    running,
+                    limit,
+                );
+            }
+            drop(state);
+            notified.await;
+        }
+    }
+}
+
+impl ProvisioningPermit {
+    async fn release(mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self.queue.state.lock().await;
+        state.running = state.running.saturating_sub(1);
+        self.released = true;
+        drop(state);
+        self.queue.changed.notify_one();
+    }
 }
 
 struct PlannedRecord {
@@ -240,11 +317,15 @@ async fn main() {
         )
         .init();
 
+    let inventory = InventoryStore::open_default().expect("open local BMC inventory");
+    let defaults = inventory
+        .load_defaults()
+        .expect("load local provisioning defaults");
     let state = Arc::new(AppState {
         plans: Mutex::new(HashMap::new()),
         jobs: Mutex::new(HashMap::new()),
-        active_job: Mutex::new(false),
-        inventory: InventoryStore::open_default().expect("open local BMC inventory"),
+        provisioning_queue: Arc::new(ProvisioningQueue::new(defaults.batch_concurrency)),
+        inventory,
         session_credentials: std::env::var("BMC_PROVISIONER_SESSION_CREDENTIALS")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")),
         session_profile_secrets: Mutex::new(HashMap::new()),
@@ -469,12 +550,6 @@ async fn apply(
     Path(plan_id): Path<Uuid>,
     Json(request): Json<ApplyRequest>,
 ) -> Result<(StatusCode, Json<JobRecord>), ApiError> {
-    let mut active = state.active_job.lock().await;
-    if *active {
-        return Err(ApiError::conflict(
-            "another BMC provisioning job is already running",
-        ));
-    }
     let planned = state
         .plans
         .lock()
@@ -491,16 +566,16 @@ async fn apply(
             }
         },
     };
-    *active = true;
-    drop(active);
-
     let job_id = Uuid::new_v4();
+    let queue_limit = state.provisioning_queue.limit().await;
     let queued = JobRecord {
         id: job_id,
         state: JobState::Queued,
         result: None,
         error: None,
-        logs: vec![job_log("任务已提交，等待执行")],
+        logs: vec![job_log(format!(
+            "任务已提交，等待写入配额（最多 {queue_limit} 台并发）"
+        ))],
     };
     state.jobs.lock().await.insert(job_id, queued.clone());
 
@@ -523,8 +598,17 @@ async fn run_job(
     credential_profile: String,
     credentials: Credentials,
 ) {
+    let (permit, running, limit) = state.provisioning_queue.acquire().await;
     update_job(&state, job_id, JobState::Running, None, None).await;
-    append_job_log(&state, job_id, format!("开始配置 {}", candidate.ip)).await;
+    append_job_log(
+        &state,
+        job_id,
+        format!(
+            "开始配置 {}（已获得写入配额 {running}/{limit}）",
+            candidate.ip
+        ),
+    )
+    .await;
     let target_network = plan.target_network.clone();
     let fingerprint = plan.certificate_fingerprint.clone();
     let password_change_requested = plan.password_change_requested;
@@ -532,12 +616,25 @@ async fn run_job(
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
     let workflow = ProvisionWorkflow::apply_with_progress(plan, credentials, Some(progress_tx));
     tokio::pin!(workflow);
+    let mut permit = Some(permit);
     let workflow_result = loop {
         tokio::select! {
             result = &mut workflow => break result,
-            Some(message) = progress_rx.recv() => append_job_log(&state, job_id, message).await,
+            Some(progress) = progress_rx.recv() => match progress {
+                WorkflowProgress::Message(message) => append_job_log(&state, job_id, message).await,
+                WorkflowProgress::NetworkChangeSubmitted => {
+                    append_job_log(&state, job_id, "静态 IPv4 已提交，正在后台等待 BMC 在新地址重连").await;
+                    if let Some(permit) = permit.take() {
+                        permit.release().await;
+                        append_job_log(&state, job_id, "已释放写入配额；下一台 BMC 可开始写入配置").await;
+                    }
+                }
+            },
         }
     };
+    if let Some(permit) = permit.take() {
+        permit.release().await;
+    }
     match workflow_result {
         Ok(result) => {
             let effective_profile = if result.password_transitioned {
@@ -594,7 +691,6 @@ async fn run_job(
             update_job(&state, job_id, JobState::Failed, None, Some(safe_error)).await;
         }
     }
-    *state.active_job.lock().await = false;
 }
 
 /// Keep a factory-credential profile reusable for other uninitialized BMCs. Once one BMC has
@@ -926,10 +1022,19 @@ async fn save_defaults(
     State(state): State<Arc<AppState>>,
     Json(defaults): Json<ProvisionDefaults>,
 ) -> Result<StatusCode, ApiError> {
+    if !matches!(defaults.batch_concurrency, 1 | 2 | 4 | 8) {
+        return Err(ApiError::bad_request(
+            "batch concurrency must be one of 1, 2, 4, or 8",
+        ));
+    }
     state
         .inventory
         .save_defaults(&defaults)
         .map_err(inventory_api_error)?;
+    state
+        .provisioning_queue
+        .set_limit(defaults.batch_concurrency)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

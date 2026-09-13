@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use thiserror::Error;
 use tokio::{
     sync::mpsc::UnboundedSender,
-    time::{Duration, sleep},
+    time::{Duration, Instant, sleep},
 };
 
 use crate::{
@@ -20,10 +20,22 @@ use crate::{
 /// Orchestrates a one-BMC change without retaining credentials in its result.
 pub struct ProvisionWorkflow;
 
-const VERIFY_ATTEMPTS: u8 = 12;
-const VERIFY_INTERVAL: Duration = Duration::from_secs(5);
+const VERIFY_DEADLINE: Duration = Duration::from_secs(90);
+const VERIFY_FAST_INTERVAL: Duration = Duration::from_secs(2);
+const VERIFY_STEADY_INTERVAL: Duration = Duration::from_secs(5);
+const VERIFY_FAST_WINDOW: Duration = Duration::from_secs(30);
 const FIRST_LOGIN_SETTLE_ATTEMPTS: u8 = 12;
 const FIRST_LOGIN_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A workflow event that is safe to show to the operator. It deliberately cannot contain
+/// credential material or raw BMC responses.
+#[derive(Clone, Debug)]
+pub enum WorkflowProgress {
+    Message(String),
+    /// Static network settings have been accepted. The caller may now release its limited
+    /// write slot while this workflow independently waits for Redfish at the new address.
+    NetworkChangeSubmitted,
+}
 
 impl ProvisionWorkflow {
     pub async fn plan(
@@ -133,7 +145,7 @@ impl ProvisionWorkflow {
     pub async fn apply_with_progress(
         plan: ProvisionPlan,
         credentials: Credentials,
-        progress: Option<UnboundedSender<String>>,
+        progress: Option<UnboundedSender<WorkflowProgress>>,
     ) -> Result<ProvisionResult, WorkflowError> {
         report(&progress, "正在连接 BMC Redfish 服务并验证当前凭据");
         let client = RedfishClient::for_ipv4_with_fingerprint(
@@ -205,14 +217,16 @@ impl ProvisionWorkflow {
             &progress,
             format!(
                 "正在写入静态 IPv4 {}/{}，网关 {}",
-                plan.target_network.address, plan.target_network.prefix, plan.target_network.gateway
+                plan.target_network.address,
+                plan.target_network.prefix,
+                plan.target_network.gateway
             ),
         );
         configured_client
             .configure_static_ipv4(&interface.uri, &plan.target_network)
             .await
             .map_err(WorkflowError::NetworkConfiguration)?;
-        report(&progress, "静态 IPv4 已提交，正在等待 BMC 在新地址重连");
+        report_network_change_submitted(&progress);
 
         // The password stays inside the authenticated client. Network changes can drop the
         // current connection immediately, so an unreachable target is a truthful non-success
@@ -221,7 +235,13 @@ impl ProvisionWorkflow {
         let status = verify_after_network_change(&verification_client, &progress)
             .await
             .map_err(WorkflowError::NetworkVerification)?;
-        report(&progress, format!("已在新地址 {} 验证 Redfish 登录", plan.target_network.address));
+        report(
+            &progress,
+            format!(
+                "已在新地址 {} 验证 Redfish 登录",
+                plan.target_network.address
+            ),
+        );
 
         Ok(ProvisionResult {
             status,
@@ -239,7 +259,7 @@ impl ProvisionWorkflow {
 /// transition as a generic pre-change authentication error.
 async fn discover_after_initial_password_change(
     client: &RedfishClient,
-    progress: &Option<UnboundedSender<String>>,
+    progress: &Option<UnboundedSender<WorkflowProgress>>,
 ) -> Result<RedfishInventory, WorkflowError> {
     for attempt in 0..FIRST_LOGIN_SETTLE_ATTEMPTS {
         match client.discover().await {
@@ -263,36 +283,51 @@ async fn discover_after_initial_password_change(
     unreachable!("retry loop returns on the final attempt")
 }
 
-/// A BMC commonly drops its current HTTPS connection when its IPv4 address changes. Retry only
-/// the authenticated Service Root read at a conservative 5-second cadence for at most one minute.
+/// A BMC commonly drops HTTPS while applying a new IPv4 address. Fast, short probes keep a
+/// failed TCP connection from delaying the next check, while a 90-second deadline still allows
+/// firmware that restarts its management stack during the change to recover naturally.
 async fn verify_after_network_change(
     client: &RedfishClient,
-    progress: &Option<UnboundedSender<String>>,
+    progress: &Option<UnboundedSender<WorkflowProgress>>,
 ) -> Result<ProvisionStatus, RedfishError> {
-    for attempt in 0..VERIFY_ATTEMPTS {
-        match client.verify_connection().await {
+    let started = Instant::now();
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        match client.verify_connection_fast().await {
             Ok(()) => return Ok(ProvisionStatus::Completed),
-            Err(RedfishError::Request(_)) if attempt + 1 < VERIFY_ATTEMPTS => {
+            Err(RedfishError::Request(_)) if started.elapsed() < VERIFY_DEADLINE => {
+                let elapsed = started.elapsed();
+                let interval = if elapsed < VERIFY_FAST_WINDOW {
+                    VERIFY_FAST_INTERVAL
+                } else {
+                    VERIFY_STEADY_INTERVAL
+                };
                 report(
                     progress,
                     format!(
-                        "等待新地址 Redfish 重连（第 {}/{} 次）",
-                        attempt + 1,
-                        VERIFY_ATTEMPTS
+                        "等待新地址 Redfish 重连（第 {attempt} 次，已等待 {} 秒；{} 秒后重试）",
+                        elapsed.as_secs(),
+                        interval.as_secs(),
                     ),
                 );
-                sleep(VERIFY_INTERVAL).await;
+                sleep(interval).await;
             }
             Err(RedfishError::Request(_)) => return Ok(ProvisionStatus::NetworkChangedUnverified),
             Err(error) => return Err(error),
         }
     }
-    Ok(ProvisionStatus::NetworkChangedUnverified)
 }
 
-fn report(progress: &Option<UnboundedSender<String>>, message: impl Into<String>) {
+fn report(progress: &Option<UnboundedSender<WorkflowProgress>>, message: impl Into<String>) {
     if let Some(sender) = progress {
-        let _ = sender.send(message.into());
+        let _ = sender.send(WorkflowProgress::Message(message.into()));
+    }
+}
+
+fn report_network_change_submitted(progress: &Option<UnboundedSender<WorkflowProgress>>) {
+    if let Some(sender) = progress {
+        let _ = sender.send(WorkflowProgress::NetworkChangeSubmitted);
     }
 }
 

@@ -53,6 +53,12 @@ pub struct ProvisionDefaults {
     pub username: String,
     pub target_prefix: u8,
     pub target_gateway: String,
+    #[serde(default = "default_batch_concurrency")]
+    pub batch_concurrency: u8,
+}
+
+fn default_batch_concurrency() -> u8 {
+    4
 }
 
 impl Default for ProvisionDefaults {
@@ -63,6 +69,7 @@ impl Default for ProvisionDefaults {
             username: "admin".to_owned(),
             target_prefix: 24,
             target_gateway: String::new(),
+            batch_concurrency: default_batch_concurrency(),
         }
     }
 }
@@ -612,5 +619,27 @@ mod tests {
         assert_eq!(profiles[0].username, "admin");
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn loads_pre_concurrency_defaults_with_a_safe_parallel_limit() {
+        let path = std::env::temp_dir().join(format!("bmc-provisioner-{}.sqlite3", Uuid::new_v4()));
+        let store = InventoryStore::open(&path).unwrap();
+        store
+            .save_setting(
+                "provision_defaults",
+                &serde_json::json!({
+                    "lessorUrl": "http://127.0.0.1:8080",
+                    "scopeId": 1,
+                    "username": "admin",
+                    "targetPrefix": 24,
+                    "targetGateway": "10.1.10.254"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(store.load_defaults().unwrap().batch_concurrency, 4);
+        drop(store);
+        let _ = fs::remove_file(path);
     }
 }

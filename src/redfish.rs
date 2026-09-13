@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, sync::Arc};
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use reqwest::{
     Response, StatusCode, Url,
@@ -101,6 +101,7 @@ pub async fn probe_certificate(ip: Ipv4Addr) -> Result<CertificateFingerprint, R
 pub struct RedfishClient {
     base_url: Url,
     client: reqwest::Client,
+    fast_verify_client: reqwest::Client,
     username: String,
     password: String,
 }
@@ -122,7 +123,8 @@ impl RedfishClient {
         // inherits HTTP(S)_PROXY by default; sending RFC1918 Redfish traffic to that proxy makes
         // a reachable BMC look like a TLS or authentication failure.
         let client = https_client(fingerprint)?;
-        Self::from_client(base_url, credentials, client)
+        let fast_verify_client = https_client_with_timeout(fingerprint, Duration::from_secs(3))?;
+        Self::from_clients(base_url, credentials, client, fast_verify_client)
     }
 
     pub fn new(base_url: Url, credentials: &Credentials) -> Result<Self, RedfishError> {
@@ -132,11 +134,9 @@ impl RedfishClient {
         if base_url.host_str().is_none() {
             return Err(RedfishError::MissingHost);
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(RedfishError::Client)?;
-        Self::from_client(base_url, credentials, client)
+        let client = https_client(None)?;
+        let fast_verify_client = https_client_with_timeout(None, Duration::from_secs(3))?;
+        Self::from_clients(base_url, credentials, client, fast_verify_client)
     }
 
     #[cfg(test)]
@@ -149,15 +149,17 @@ impl RedfishClient {
         Self {
             base_url,
             client: reqwest::Client::new(),
+            fast_verify_client: reqwest::Client::new(),
             username: credentials.username.clone(),
             password: credentials.current_password.clone(),
         }
     }
 
-    fn from_client(
+    fn from_clients(
         base_url: Url,
         credentials: &Credentials,
         client: reqwest::Client,
+        fast_verify_client: reqwest::Client,
     ) -> Result<Self, RedfishError> {
         if base_url.scheme() != "https" {
             return Err(RedfishError::HttpsRequired);
@@ -168,6 +170,7 @@ impl RedfishClient {
         Ok(Self {
             base_url,
             client,
+            fast_verify_client,
             username: credentials.username.clone(),
             password: credentials.current_password.clone(),
         })
@@ -178,6 +181,7 @@ impl RedfishClient {
         Self {
             base_url: self.base_url.clone(),
             client: self.client.clone(),
+            fast_verify_client: self.fast_verify_client.clone(),
             username: self.username.clone(),
             password,
         }
@@ -190,6 +194,7 @@ impl RedfishClient {
         Ok(Self {
             base_url,
             client: self.client.clone(),
+            fast_verify_client: self.fast_verify_client.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
         })
@@ -366,6 +371,23 @@ impl RedfishClient {
         Ok(())
     }
 
+    /// A deliberately short authenticated probe for a BMC that is expected to be temporarily
+    /// unavailable while applying a network change. Normal discovery keeps the firmware's
+    /// regular request behavior; only this retry loop uses the three-second deadline.
+    pub async fn verify_connection_fast(&self) -> Result<(), RedfishError> {
+        let url = self.resource_url("/redfish/v1/")?;
+        let response = self
+            .fast_verify_client
+            .get(url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(RedfishError::Request)?;
+        let response = ensure_success(response).await?;
+        let _: ServiceRoot = response.json().await.map_err(RedfishError::Decode)?;
+        Ok(())
+    }
+
     async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         resource: &str,
@@ -473,19 +495,35 @@ pub async fn reset_ami_web_initial_password(
 }
 
 fn https_client(fingerprint: Option<&str>) -> Result<reqwest::Client, RedfishError> {
+    https_client_with_options(fingerprint, None)
+}
+
+fn https_client_with_timeout(
+    fingerprint: Option<&str>,
+    timeout: Duration,
+) -> Result<reqwest::Client, RedfishError> {
+    https_client_with_options(fingerprint, Some(timeout))
+}
+
+fn https_client_with_options(
+    fingerprint: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Client, RedfishError> {
+    let mut builder = reqwest::Client::builder().no_proxy();
+    if let Some(timeout) = timeout {
+        builder = builder
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(timeout);
+    }
     match fingerprint {
         Some(fingerprint) => {
             let fingerprint = CertificateFingerprint::parse(fingerprint)?;
-            reqwest::Client::builder()
-                .no_proxy()
+            builder
                 .use_preconfigured_tls(pinned_tls_config(Some(fingerprint)))
                 .build()
                 .map_err(RedfishError::Client)
         }
-        None => reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(RedfishError::Client),
+        None => builder.build().map_err(RedfishError::Client),
     }
 }
 

@@ -19,6 +19,7 @@
   let scopeId = 1;
   let targetPrefix = 24;
   let targetGateway = '';
+  let batchConcurrency = 4;
   let candidates:Candidate[] = [];
   let managed:Managed[] = [];
   let profiles:Profile[] = [];
@@ -63,11 +64,11 @@
     profileByRow = Object.fromEntries(rows.map(row => [row.identity, profileByRow[row.identity] ?? row.managed?.credentialProfile ?? '']));
   }
   async function defaults() {
-    try { const response = await fetch(`${base}/api/v1/settings/defaults`); if (!response.ok) return; const {defaults:value} = await response.json(); lessorUrl=value.lessorUrl; scopeId=value.scopeId; targetPrefix=value.targetPrefix; targetGateway=value.targetGateway; } catch {}
+    try { const response = await fetch(`${base}/api/v1/settings/defaults`); if (!response.ok) return; const {defaults:value} = await response.json(); lessorUrl=value.lessorUrl; scopeId=value.scopeId; targetPrefix=value.targetPrefix; targetGateway=value.targetGateway; batchConcurrency=value.batchConcurrency??4; } catch {}
   }
   async function saveConnection() {
     savingConnection = true; error='';
-    try { const response = await fetch(`${base}/api/v1/settings/defaults`, {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify({lessorUrl,scopeId,username:'',targetPrefix,targetGateway})}); if (!response.ok) throw Error('无法保存全局连接设置'); message='已保存全局连接与网络默认值。'; } catch(reason) { error=reason instanceof Error ? reason.message : '保存失败'; } finally { savingConnection=false; }
+    try { const response = await fetch(`${base}/api/v1/settings/defaults`, {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify({lessorUrl,scopeId,username:'',targetPrefix,targetGateway,batchConcurrency})}); if (!response.ok) throw Error('无法保存全局连接设置'); message='已保存全局连接、网络默认值与批量并发数。'; } catch(reason) { error=reason instanceof Error ? reason.message : '保存失败'; } finally { savingConnection=false; }
   }
   function requireArray(value:unknown, label:string): any[] {
     if (!Array.isArray(value)) throw Error(`${label}返回了无效的数据格式，请确认桌面端本地服务已升级。`);
@@ -93,30 +94,36 @@
     } catch(reason) { error=reason instanceof Error ? reason.message : '刷新失败'; } finally { loading=false; progress=''; }
   }
   function appendExecutionLog(message:string) { executionLogs=[...executionLogs,{timestampMs:Date.now(),message}].slice(-200); }
-  function mergeJobLogs(job:any, seen:Set<string>) {
+  function mergeJobLogs(job:any, seen:Set<string>, ip:string) {
     const entries=Array.isArray(job.logs) ? job.logs as JobLog[] : [];
     const unseen=entries.filter(entry=>{
       const key=`${entry.timestampMs}:${entry.message}`;
       if(seen.has(key)) return false;
       seen.add(key); return true;
     });
-    if(unseen.length) executionLogs=[...executionLogs,...unseen].slice(-200);
+    if(unseen.length) executionLogs=[...executionLogs,...unseen.map(entry=>({...entry,message:`${ip}：${entry.message}`}))].slice(-200);
   }
   function timestamp(value:number) { return new Date(value).toLocaleTimeString('zh-CN',{hour12:false}); }
-  async function wait(job:any, seen:Set<string>) { mergeJobLogs(job,seen); while(['queued','running'].includes(job.state)) { await new Promise(resolve=>setTimeout(resolve,1500)); job=await json(await fetch(`${base}/api/v1/jobs/${job.id}`)); mergeJobLogs(job,seen); } return job; }
+  async function wait(job:any, seen:Set<string>, ip:string) { mergeJobLogs(job,seen,ip); while(['queued','running'].includes(job.state)) { await new Promise(resolve=>setTimeout(resolve,1500)); job=await json(await fetch(`${base}/api/v1/jobs/${job.id}`)); mergeJobLogs(job,seen,ip); } return job; }
+  async function runWithLimit<T>(items:T[], limit:number, work:(item:T,index:number)=>Promise<void>) { let next=0; const workers=Array.from({length:Math.min(limit,items.length)},async()=>{while(next<items.length){const index=next++;await work(items[index],index);}}); await Promise.all(workers); }
   async function execute() {
     const selected=rows.filter(row=>row.candidate && !row.frozen && picked[row.identity]);
     if(!selected.length || !targetGateway || selected.some(row=>!targets[row.identity] || !profileByRow[row.identity])) { error='请勾选 BMC，并为每台填写目标 IPv4、选择凭据档案。'; return; }
-    executing=true; error=''; executionLogs=[]; appendExecutionLog(`批量配置开始：共 ${selected.length} 台 BMC`); const failed:string[]=[];
-    for(const [index,row] of selected.entries()) {
-      const candidate=row.candidate!, profileName=profileByRow[row.identity]; progress=`${index+1}/${selected.length}：${candidate.ip} → ${targets[row.identity]}`;
+    executing=true; error=''; executionLogs=[]; appendExecutionLog(`批量配置开始：共 ${selected.length} 台 BMC，预检并发 ${batchConcurrency}，写入并发 ${batchConcurrency}`); const failed:string[]=[]; const plannedJobs:{row:Row;planId:string;ip:string}[]=[];
+    await runWithLimit(selected,batchConcurrency,async(row,index)=>{
+      const candidate=row.candidate!, profileName=profileByRow[row.identity]; progress=`预检 ${index+1}/${selected.length}：${candidate.ip} → ${targets[row.identity]}`;
       try {
         appendExecutionLog(`${candidate.ip}：正在读取 HTTPS 证书并生成配置任务`);
         const certificate=await fetch(`${base}/api/v1/certificates/probe`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip})}), certificateValue:any=await json(certificate); if(!certificate.ok) throw Error(certificateValue.error ?? '无法读取 HTTPS 证书');
-        const plan=await fetch(`${base}/api/v1/provision/plan`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip,targetNetwork:{address:targets[row.identity],prefix:targetPrefix,gateway:targetGateway},certificateFingerprint:certificateValue.fingerprint.sha256,passwordChange:false,credentialProfile:profileName})}), planned:any=await json(plan); if(!plan.ok) throw Error(planned.details?.reason ?? planned.error ?? '无法生成内部配置');
-        const apply=await fetch(`${base}/api/v1/provision/plans/${planned.planId}/apply`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})}), submitted:any=await json(apply); if(!apply.ok) throw Error(submitted.error ?? '无法提交'); const completed=await wait(submitted,new Set<string>()); if(completed.state!=='completed') throw Error(completed.error ?? '配置失败');
+        const plan=await fetch(`${base}/api/v1/provision/plan`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip,targetNetwork:{address:targets[row.identity],prefix:targetPrefix,gateway:targetGateway},certificateFingerprint:certificateValue.fingerprint.sha256,passwordChange:false,credentialProfile:profileName})}), planResponse:any=await json(plan); if(!plan.ok) throw Error(planResponse.details?.reason ?? planResponse.error ?? '无法生成内部配置');
+        plannedJobs.push({row,planId:planResponse.planId,ip:candidate.ip}); appendExecutionLog(`${candidate.ip}：预检完成，等待批量写入`);
       } catch(reason) { const detail=reason instanceof Error ? reason.message : '失败'; appendExecutionLog(`${candidate.ip}：配置失败：${detail}`); failed.push(`${candidate.ip}：${detail}`); }
-    }
+    });
+    appendExecutionLog(`预检完成：${plannedJobs.length} 台可执行，${failed.length} 台失败；正在提交写入队列`);
+    const jobs:{ip:string;job:any}[]=[];
+    await Promise.all(plannedJobs.map(async item=>{try{const apply=await fetch(`${base}/api/v1/provision/plans/${item.planId}/apply`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})}), submitted:any=await json(apply);if(!apply.ok)throw Error(submitted.error??'无法提交');jobs.push({ip:item.ip,job:submitted});}catch(reason){const detail=reason instanceof Error?reason.message:'失败';appendExecutionLog(`${item.ip}：提交失败：${detail}`);failed.push(`${item.ip}：${detail}`);}}));
+    appendExecutionLog(`已提交 ${jobs.length} 个写入任务；静态 IP 写入与新地址验证将交错进行`);
+    await Promise.all(jobs.map(async item=>{try{const completed=await wait(item.job,new Set<string>(),item.ip);if(completed.state!=='completed')throw Error(completed.error??'配置失败');}catch(reason){const detail=reason instanceof Error?reason.message:'失败';appendExecutionLog(`${item.ip}：配置失败：${detail}`);failed.push(`${item.ip}：${detail}`);}}));
     await Promise.all([inventory(), loadProfiles()]); executing=false; progress=''; appendExecutionLog(`批量任务完成：成功 ${selected.length-failed.length} 台，失败 ${failed.length} 台`); message=`批量任务完成：成功 ${selected.length-failed.length} 台，失败 ${failed.length} 台。`; if(failed.length) error=failed.join('；');
   }
   async function selectProfile(row:Row, name:string) {
@@ -145,7 +152,7 @@
     {#if rows.length}<div class="bmc-table"><div class="bmc-row table-heading"><span>选择 / BMC</span><span>MAC / 作用域</span><span>凭据档案</span><span>目标静态 IPv4 / 访问</span><span>状态</span></div>{#each rows as row}<div class:frozen={row.frozen} class="bmc-row"><label class="pick"><input type="checkbox" checked={picked[row.identity]} disabled={row.frozen||!row.candidate} onchange={event=>choose(row.identity,event.currentTarget.checked)}/><span><strong>{row.frozen?row.address:row.sourceIp}</strong><small>{row.frozen?`已冻结；来源 ${row.sourceIp}`:row.candidate?candidateLabel(row.candidate):'本地历史记录'}</small></span></label><span><code>{row.mac??'MAC 未返回'}</code><small>{row.scopeName}{row.subnet?` / ${row.subnet}/${row.prefix}`:''}</small></span><select value={profileByRow[row.identity]??''} onchange={event=>selectProfile(row,event.currentTarget.value)}><option value="">选择档案</option>{#each profiles as item}<option value={item.name}>{item.name} · {item.username}</option>{/each}</select><span>{#if row.managed&&editing===row.managed.identity}<input bind:value={editAddress}/><button onclick={()=>saveAddress(row.managed!)}>保存</button>{:else}<input value={targets[row.identity]??''} disabled={row.frozen||!row.candidate} oninput={event=>setTarget(row.identity,event.currentTarget.value)} placeholder="例如 172.16.40.200"/>{#if row.managed}<a href={`https://${row.address}`} onclick={event=>{event.preventDefault();void open(row.address)}}>https://{row.address}</a>{/if}{/if}</span>{#if row.managed}<span><strong>{label(row.managed.configurationStatus)}{row.frozen?' · 已冻结':''}</strong><small>{label(row.managed.onlineStatus)} / {label(row.managed.redfishStatus)} / {label(row.managed.authenticationStatus)}</small><span class="row-actions"><button onclick={()=>{editing=row.managed!.identity;editAddress=row.managed!.currentIp}}>编辑地址</button><button class="text-danger" onclick={()=>remove(row.managed!)}>删除</button></span></span>{:else}<span><strong>待配置</strong><small>配置后自动记录访问状态</small></span>{/if}</div>{/each}</div><div class="batch-bar"><span>目标网络：/{targetPrefix}，网关 {targetGateway||'未设置'}</span><button class="danger" onclick={execute} disabled={executing}>执行已勾选 BMC 的 IP 变更配置</button></div>{:else}<p class="muted">尚未读取到 BMC；请检查 lessor 连接设置。</p>{/if}
     <div class="manual-add"><strong>手动加入清单</strong><input bind:value={manualIp} placeholder="BMC IPv4，例如 172.16.40.200"/><input bind:value={manualMac} placeholder="MAC（可选）"/><select bind:value={manualProfile}><option value="">凭据档案（可选）</option>{#each profiles as item}<option value={item.name}>{item.name}</option>{/each}</select><button class="secondary" onclick={addManual}>加入清单</button></div></section>
   {:else if tab==='connection'}
-    <section class="settings-page"><div class="section-title"><div><h2>连接设置</h2><p>lessor 是全局的 BMC 动态发现来源。</p></div></div><div class="setting-grid"><label>lessor 地址<input bind:value={lessorUrl} placeholder="http://127.0.0.1:8080"/></label><label>作用域 ID<input bind:value={scopeId} type="number" min="1"/></label></div><div class="setting-grid network"><label>默认 IPv4 前缀<input bind:value={targetPrefix} type="number" min="1" max="32"/></label><label>默认网关<input bind:value={targetGateway} placeholder="172.16.40.254"/></label></div><button class="primary" onclick={saveConnection} disabled={savingConnection}>{savingConnection?'保存中…':'保存连接设置'}</button></section>
+    <section class="settings-page"><div class="section-title"><div><h2>连接设置</h2><p>lessor 是全局的 BMC 动态发现来源。批量写入默认最多同时处理 4 台；新地址验证不占用写入配额。</p></div></div><div class="setting-grid"><label>lessor 地址<input bind:value={lessorUrl} placeholder="http://127.0.0.1:8080"/></label><label>作用域 ID<input bind:value={scopeId} type="number" min="1"/></label></div><div class="setting-grid network"><label>默认 IPv4 前缀<input bind:value={targetPrefix} type="number" min="1" max="32"/></label><label>默认网关<input bind:value={targetGateway} placeholder="172.16.40.254"/></label><label>批量写入并发<select bind:value={batchConcurrency}><option value={1}>1 台（串行）</option><option value={2}>2 台</option><option value={4}>4 台（默认）</option><option value={8}>8 台</option></select></label></div><button class="primary" onclick={saveConnection} disabled={savingConnection}>{savingConnection?'保存中…':'保存连接设置'}</button></section>
   {:else}
     <section class="settings-page"><div class="section-title"><div><h2>凭据档案</h2><p>档案名称和用户名保存到本机数据目录；桌面端密码仅保存到 Windows 凭据管理器。Docker 使用当前服务会话，服务重启后需要重新填写密码。</p></div></div><div class="profile-form"><label>档案名称<input bind:value={profileName} placeholder="例如 default、rack-a"/></label><label>用户名<input bind:value={profileUsername} placeholder="root"/></label><label>当前密码<input bind:value={profileCurrentPassword} type="password"/></label><label>新密码 <small>首次强制改密时使用</small><input bind:value={profileNewPassword} type="password"/></label><button class="primary" onclick={saveProfile}>保存档案</button></div><div class="profile-recovery"><span><strong>恢复已有 Windows 档案</strong><small>升级前的密码仍在凭据管理器时，输入原档案名即可恢复其名称和用户名；不会显示、导出或改写密码。</small></span><input bind:value={restoreProfileName} placeholder="例如 asrr-default" onkeydown={event=>{if(event.key==='Enter')void restoreProfile()}}/><button class="secondary" onclick={restoreProfile}>恢复档案</button></div>{#if profiles.length}<div class="profile-list">{#each profiles as item}<div><span><strong>{item.name}</strong><small>{item.username} · 系统凭据管理器或当前服务会话</small></span><button class="text-danger" onclick={()=>removeProfile(item.name)}>删除</button></div>{/each}</div>{:else}<p class="muted">还没有凭据档案。先创建一个档案，或恢复已有的 Windows 档案，再回到 BMC 清单逐行选择。</p>{/if}</section>
   {/if}
