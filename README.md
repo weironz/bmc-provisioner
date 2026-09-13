@@ -15,6 +15,7 @@
 - [MVP 设计](docs/design.md)
 - [开发计划](docs/development-plan.md)
 - [本地 API](docs/api.md)
+- [Docker Compose 部署指引](docs/deployment.md)
 
 > 这是独立项目。lessor 只负责 DHCP 与 BMC IPMI 发现；本项目不修改 lessor
 > 的配置，也不承载 DHCP 服务。
@@ -59,8 +60,9 @@ just app
 ## IDC Docker Compose
 
 `compose.yaml` 同时启动 `lessord` 与 bmc-provisioner，适合部署在**可路由到 BMC
-管理网的 Linux 主机**。lessord 使用 host 网络以接收 DHCP 广播；两个管理界面仅监听
-该主机的 `127.0.0.1`，从办公网访问应使用 VPN 或 SSH 隧道。
+管理网的 Linux 主机**。lessord 使用 host 网络以接收 DHCP 广播；默认通过宿主机所有
+地址开放 Web 管理界面。完整的前置条件、防火墙示例、升级与数据卷说明见
+[部署指引](docs/deployment.md)。
 
 ```sh
 cp .env.example .env
@@ -70,8 +72,8 @@ docker compose up -d
 
 首次启动后：
 
-1. 通过 `http://127.0.0.1:8080` 打开 lessor，选择网卡并创建 DHCP 作用域；
-2. 通过 `http://127.0.0.1:6770` 打开 bmc-provisioner；lessor 地址保持默认
+1. 通过 `http://<服务器地址>:8080` 打开 lessor，选择网卡并创建 DHCP 作用域；
+2. 通过 `http://<服务器地址>:6770` 打开 bmc-provisioner；lessor 地址保持默认
    `http://127.0.0.1:8080`；
 3. 在“凭据档案”创建 BMC 凭据，再在清单每行选择对应档案。Compose 默认使用
    `BMC_PROVISIONER_SESSION_CREDENTIALS=1`：由于容器通常没有系统密钥链，密码只
