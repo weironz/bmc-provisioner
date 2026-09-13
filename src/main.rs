@@ -1,4 +1,10 @@
-use std::{collections::HashMap, net::Ipv4Addr, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::Ipv4Addr,
+    net::SocketAddr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
@@ -15,7 +21,7 @@ use bmc_provisioner::{
     workflow::ProvisionWorkflow,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -199,6 +205,16 @@ struct JobRecord {
     state: JobState,
     result: Option<ProvisionResult>,
     error: Option<String>,
+    logs: Vec<JobLogEntry>,
+}
+
+/// A brief, operator-facing status update. It deliberately excludes passwords, account URIs
+/// and raw Redfish error bodies so the task API remains safe to display and retain in memory.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobLogEntry {
+    timestamp_ms: u128,
+    message: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -480,6 +496,7 @@ async fn apply(
         state: JobState::Queued,
         result: None,
         error: None,
+        logs: vec![job_log("任务已提交，等待执行")],
     };
     state.jobs.lock().await.insert(job_id, queued.clone());
 
@@ -503,21 +520,56 @@ async fn run_job(
     credentials: Credentials,
 ) {
     update_job(&state, job_id, JobState::Running, None, None).await;
+    append_job_log(&state, job_id, format!("开始配置 {}", candidate.ip)).await;
     let target_network = plan.target_network.clone();
     let fingerprint = plan.certificate_fingerprint.clone();
     let password_change_requested = plan.password_change_requested;
-    match ProvisionWorkflow::apply(plan, credentials).await {
+    let credentials_for_rotation = credentials.clone();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let workflow = ProvisionWorkflow::apply_with_progress(plan, credentials, Some(progress_tx));
+    tokio::pin!(workflow);
+    let workflow_result = loop {
+        tokio::select! {
+            result = &mut workflow => break result,
+            Some(message) = progress_rx.recv() => append_job_log(&state, job_id, message).await,
+        }
+    };
+    match workflow_result {
         Ok(result) => {
+            let effective_profile = if result.password_transitioned {
+                match save_transitioned_profile(
+                    state.as_ref(),
+                    &candidate,
+                    &credential_profile,
+                    &credentials_for_rotation,
+                )
+                .await
+                {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        // The BMC result remains truthful even if the local credential vault
+                        // cannot be updated. Do not replace a successful BMC configuration with
+                        // a fabricated failure; retain the original profile and log no secret.
+                        tracing::warn!(status = ?error.status, job_id = %job_id, "could not save the transitioned BMC credential profile");
+                        credential_profile.clone()
+                    }
+                }
+            } else {
+                credential_profile.clone()
+            };
             if let Err(error) = state.inventory.record_provision(
                 &candidate,
                 &target_network,
                 fingerprint.as_deref(),
-                &credential_profile,
+                &effective_profile,
                 Some(&result),
                 None,
             ) {
                 tracing::error!(error = %error, job_id = %job_id, "could not persist configured BMC inventory");
+            } else {
+                append_job_log(&state, job_id, "已保存本地 BMC 清单与访问状态").await;
             }
+            append_job_log(&state, job_id, "配置完成").await;
             update_job(&state, job_id, JobState::Completed, Some(result), None).await;
         }
         Err(error) => {
@@ -534,10 +586,72 @@ async fn run_job(
             ) {
                 tracing::error!(error = %store_error, job_id = %job_id, "could not persist failed BMC inventory");
             }
+            append_job_log(&state, job_id, format!("配置失败：{safe_error}")).await;
             update_job(&state, job_id, JobState::Failed, None, Some(safe_error)).await;
         }
     }
     *state.active_job.lock().await = false;
+}
+
+/// Keep a factory-credential profile reusable for other uninitialized BMCs. Once one BMC has
+/// transitioned, that BMC receives a MAC-specific profile containing the new current password
+/// and no further password-change request. SQLite records only the profile label.
+async fn save_transitioned_profile(
+    state: &AppState,
+    candidate: &BmcCandidate,
+    bootstrap_profile: &str,
+    credentials: &Credentials,
+) -> Result<String, ApiError> {
+    if credentials.new_password.is_empty() {
+        return Err(ApiError::internal(
+            "initial password transition completed without a replacement password",
+        ));
+    }
+    let suffix = candidate
+        .mac
+        .as_deref()
+        .map(|mac| {
+            mac.chars()
+                .filter(|character| character.is_ascii_hexdigit())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .filter(|mac| !mac.is_empty())
+        .unwrap_or_else(|| candidate.ip.to_string().replace('.', "-"));
+    let prefix: String = bootstrap_profile.chars().take(47).collect();
+    let profile = valid_profile_name(&format!("{prefix}-bmc-{suffix}"))?;
+    save_profile_secret(
+        state,
+        &profile,
+        CredentialProfileSecret {
+            username: credentials.username.clone(),
+            current_password: credentials.new_password.clone(),
+            new_password: String::new(),
+        },
+    )
+    .await?;
+
+    let mut profiles = state
+        .inventory
+        .credential_profiles()
+        .map_err(inventory_api_error)?;
+    if let Some(existing) = profiles
+        .iter_mut()
+        .find(|existing| existing.name == profile)
+    {
+        existing.username = credentials.username.clone();
+    } else {
+        profiles.push(CredentialProfileMeta {
+            name: profile.clone(),
+            username: credentials.username.clone(),
+        });
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    state
+        .inventory
+        .save_credential_profiles(&profiles)
+        .map_err(inventory_api_error)?;
+    Ok(profile)
 }
 
 fn provisioning_failure_message(
@@ -552,6 +666,26 @@ fn provisioning_failure_message(
         // These strings intentionally do not include account names, credentials, or BMC bodies.
         WorkflowError::Redfish(RedfishError::AuthenticationFailed) => {
             "BMC authentication failed before any change; check the current username and password"
+                .to_owned()
+        }
+        WorkflowError::NewPasswordRequired => {
+            "BMC requires its factory password to be changed first; provide a new password in the selected credential profile"
+                .to_owned()
+        }
+        WorkflowError::InitialPasswordBootstrap(RedfishError::AuthenticationFailed) => {
+            "BMC rejected the current factory credentials during the required initial password change; no network change was attempted"
+                .to_owned()
+        }
+        WorkflowError::InitialPasswordBootstrap(RedfishError::AmiWebBootstrapUnsupported) => {
+            "BMC requires an initial password change but does not expose the supported AMI compatibility API; no network change was attempted"
+                .to_owned()
+        }
+        WorkflowError::InitialPasswordBootstrap(_) => {
+            "BMC rejected the required initial password change; the network configuration was not attempted"
+                .to_owned()
+        }
+        WorkflowError::PostInitialPasswordChange(_) => {
+            "BMC accepted the initial password change, but Redfish did not become ready afterward; no network configuration was attempted"
                 .to_owned()
         }
         WorkflowError::Redfish(RedfishError::Request(_)) => {
@@ -597,6 +731,22 @@ fn provisioning_failure_message(
             } else {
                 ""
             };
+            if matches!(
+                redfish_error,
+                bmc_provisioner::redfish::RedfishError::DhcpV4DisabledButStaticIpv4Incomplete(_)
+            ) {
+                return format!(
+                    "{password_notice}BMC accepted the DHCPv4 disable, but static IPv4 configuration did not complete; verify the current BMC address before retrying"
+                );
+            }
+            if matches!(
+                redfish_error,
+                bmc_provisioner::redfish::RedfishError::StaticIpv4ConfiguredButDhcpV4StillEnabled(_)
+            ) {
+                return format!(
+                    "{password_notice}BMC accepted the static IPv4 address, but DHCPv4 disable did not complete; verify both the old and target BMC addresses before retrying"
+                );
+            }
             format!(
                 "{password_notice}BMC rejected the static IPv4 configuration{}",
                 redfish_failure_context(redfish_error)
@@ -643,6 +793,23 @@ async fn update_job(
         job.state = job_state;
         job.result = result;
         job.error = error;
+    }
+}
+
+async fn append_job_log(state: &AppState, job_id: Uuid, message: impl Into<String>) {
+    if let Some(job) = state.jobs.lock().await.get_mut(&job_id) {
+        job.logs.push(job_log(message));
+    }
+}
+
+fn job_log(message: impl Into<String>) -> JobLogEntry {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    JobLogEntry {
+        timestamp_ms,
+        message: message.into(),
     }
 }
 
@@ -1051,6 +1218,12 @@ fn workflow_api_error(error: bmc_provisioner::workflow::WorkflowError) -> ApiErr
         }
         WorkflowError::Redfish(RedfishError::AuthenticationFailed) => ApiError::unprocessable(
             "BMC authentication failed; check the current username and password",
+        ),
+        WorkflowError::NewPasswordRequired => ApiError::unprocessable(
+            "BMC requires its factory password to be changed first; provide a new password in the selected credential profile",
+        ),
+        WorkflowError::PostInitialPasswordChange(_) => ApiError::unprocessable(
+            "BMC password changed but Redfish did not become ready; wait briefly and retry with the same credential profile",
         ),
         WorkflowError::Redfish(RedfishError::AccountNotFound(_)) => ApiError::unprocessable(
             "BMC accepted the connection but did not expose the selected Redfish account",

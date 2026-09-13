@@ -83,7 +83,7 @@ pub enum NetworkValidationError {
 }
 
 /// Request-only credential material. It intentionally cannot be serialized or debug-printed.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Credentials {
     pub username: String,
@@ -108,12 +108,33 @@ impl std::fmt::Debug for Credentials {
 pub struct ProvisionPlan {
     pub source_ip: Ipv4Addr,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_mac: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_fingerprint: Option<String>,
-    pub account_uri: String,
-    pub ethernet_interface_uri: String,
+    /// The first-login bootstrap cannot discover these resources until it has changed the
+    /// manufacturer password. They are therefore absent only for that narrowly scoped path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ethernet_interface_uri: Option<String>,
     pub current_password_change_required: bool,
     pub password_change_requested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_login_bootstrap: Option<FirstLoginBootstrap>,
     pub target_network: StaticNetwork,
+}
+
+/// A narrowly-scoped, vendor-specific initial-password transition. Normal BMC provisioning
+/// remains Redfish-only; this is used only when a Redfish session reports PasswordChangeRequired
+/// but the firmware blocks the standard ManagerAccount resource needed to perform that change.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FirstLoginBootstrap {
+    AmiWeb,
+    /// A previous attempt changed the factory password but did not finish network provisioning.
+    /// Retry Redfish with the profile's remembered new password; do not submit the AMI change
+    /// endpoint a second time.
+    AmiPasswordAlreadyChanged,
 }
 
 /// Result safe to retain in an API job record or display in a UI.
@@ -128,6 +149,9 @@ pub enum ProvisionStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ProvisionResult {
     pub status: ProvisionStatus,
+    /// The credential profile's requested new password authenticated this BMC. This is public
+    /// outcome metadata only; the password itself is never part of a result or job record.
+    pub password_transitioned: bool,
     pub source_ip: Ipv4Addr,
     pub target_ip: Ipv4Addr,
     pub account_uri: String,

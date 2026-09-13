@@ -1,6 +1,6 @@
 [package]
 name = "bmc-provisioner"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "Provision a single DHCP-addressed BMC through lessor and Redfish"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 axum = "0.8"
 keyring = "4.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }

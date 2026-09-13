@@ -1,11 +1,20 @@
 use std::net::Ipv4Addr;
 
 use thiserror::Error;
-use tokio::time::{Duration, sleep};
+use tokio::{
+    sync::mpsc::UnboundedSender,
+    time::{Duration, sleep},
+};
 
 use crate::{
-    model::{Credentials, ProvisionPlan, ProvisionResult, ProvisionStatus, StaticNetwork},
-    redfish::{EthernetInterface, RedfishClient, RedfishError, RedfishInventory},
+    model::{
+        Credentials, FirstLoginBootstrap, ProvisionPlan, ProvisionResult, ProvisionStatus,
+        StaticNetwork,
+    },
+    redfish::{
+        EthernetInterface, RedfishClient, RedfishError, RedfishInventory,
+        ami_web_first_login_supported, reset_ami_web_initial_password,
+    },
 };
 
 /// Orchestrates a one-BMC change without retaining credentials in its result.
@@ -13,6 +22,8 @@ pub struct ProvisionWorkflow;
 
 const VERIFY_ATTEMPTS: u8 = 12;
 const VERIFY_INTERVAL: Duration = Duration::from_secs(5);
+const FIRST_LOGIN_SETTLE_ATTEMPTS: u8 = 12;
+const FIRST_LOGIN_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 
 impl ProvisionWorkflow {
     pub async fn plan(
@@ -30,18 +41,82 @@ impl ProvisionWorkflow {
             credentials,
             certificate_fingerprint,
         )?;
-        let inventory = client.discover().await?;
+        let inventory = match client.discover().await {
+            Ok(inventory) => inventory,
+            // A few AMI implementations authenticate an initial account but block Basic-auth
+            // access to AccountService until their web UI password transition has completed.
+            // Probe the public script signature only after that exact authentication failure.
+            Err(RedfishError::AuthenticationFailed) => {
+                if credentials.new_password.is_empty() {
+                    return Err(WorkflowError::NewPasswordRequired);
+                }
+                if ami_web_first_login_supported(source_ip, certificate_fingerprint).await? {
+                    // A password change can have succeeded even if the previous task lost its
+                    // Redfish connection before reaching network configuration. Before trying
+                    // the AMI endpoint again, see whether the stored requested new password is
+                    // already the active Redfish credential.
+                    match client
+                        .with_password(credentials.new_password.clone())
+                        .discover()
+                        .await
+                    {
+                        Ok(inventory) => {
+                            let interface = select_interface(
+                                &inventory,
+                                requested_interface_uri,
+                                source_ip,
+                                source_mac,
+                            )?;
+                            return Ok(ProvisionPlan {
+                                source_ip,
+                                source_mac: source_mac.map(ToOwned::to_owned),
+                                certificate_fingerprint: certificate_fingerprint
+                                    .map(ToOwned::to_owned),
+                                account_uri: Some(inventory.account.uri),
+                                ethernet_interface_uri: Some(interface.uri),
+                                current_password_change_required: false,
+                                password_change_requested: false,
+                                first_login_bootstrap: Some(
+                                    FirstLoginBootstrap::AmiPasswordAlreadyChanged,
+                                ),
+                                target_network,
+                            });
+                        }
+                        Err(RedfishError::AuthenticationFailed) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    return Ok(ProvisionPlan {
+                        source_ip,
+                        source_mac: source_mac.map(ToOwned::to_owned),
+                        certificate_fingerprint: certificate_fingerprint.map(ToOwned::to_owned),
+                        account_uri: None,
+                        ethernet_interface_uri: None,
+                        current_password_change_required: true,
+                        password_change_requested: true,
+                        first_login_bootstrap: Some(FirstLoginBootstrap::AmiWeb),
+                        target_network,
+                    });
+                }
+                return Err(WorkflowError::Redfish(RedfishError::AuthenticationFailed));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let interface =
             select_interface(&inventory, requested_interface_uri, source_ip, source_mac)?;
         let password_change_requested =
             password_change_requested || inventory.account.password_change_required;
+        if password_change_requested && credentials.new_password.is_empty() {
+            return Err(WorkflowError::NewPasswordRequired);
+        }
         Ok(ProvisionPlan {
             source_ip,
+            source_mac: source_mac.map(ToOwned::to_owned),
             certificate_fingerprint: certificate_fingerprint.map(ToOwned::to_owned),
-            account_uri: inventory.account.uri,
-            ethernet_interface_uri: interface.uri,
+            account_uri: Some(inventory.account.uri),
+            ethernet_interface_uri: Some(interface.uri),
             current_password_change_required: inventory.account.password_change_required,
             password_change_requested,
+            first_login_bootstrap: None,
             target_network,
         })
     }
@@ -50,65 +125,162 @@ impl ProvisionWorkflow {
         plan: ProvisionPlan,
         credentials: Credentials,
     ) -> Result<ProvisionResult, WorkflowError> {
+        Self::apply_with_progress(plan, credentials, None).await
+    }
+
+    /// Applies a plan while optionally emitting operator-visible, non-sensitive milestones.
+    /// Passwords, account URIs and raw BMC response bodies must never be sent here.
+    pub async fn apply_with_progress(
+        plan: ProvisionPlan,
+        credentials: Credentials,
+        progress: Option<UnboundedSender<String>>,
+    ) -> Result<ProvisionResult, WorkflowError> {
+        report(&progress, "正在连接 BMC Redfish 服务并验证当前凭据");
         let client = RedfishClient::for_ipv4_with_fingerprint(
             plan.source_ip,
             &credentials,
             plan.certificate_fingerprint.as_deref(),
         )?;
-        let inventory = client.discover().await?;
-        if inventory.account.uri != plan.account_uri {
+        let bootstrap = matches!(
+            plan.first_login_bootstrap,
+            Some(FirstLoginBootstrap::AmiWeb)
+        );
+        let password_already_changed = matches!(
+            plan.first_login_bootstrap,
+            Some(FirstLoginBootstrap::AmiPasswordAlreadyChanged)
+        );
+        let (client, inventory) = if bootstrap {
+            if credentials.new_password.is_empty() {
+                return Err(WorkflowError::NewPasswordRequired);
+            }
+            report(&progress, "检测到首次登录策略，正在完成初始密码变更");
+            reset_ami_web_initial_password(
+                plan.source_ip,
+                &credentials,
+                plan.certificate_fingerprint.as_deref(),
+            )
+            .await
+            .map_err(WorkflowError::InitialPasswordBootstrap)?;
+            report(&progress, "初始密码变更已提交，正在等待 Redfish 认证就绪");
+            let client = client.with_password(credentials.new_password.clone());
+            let inventory = discover_after_initial_password_change(&client, &progress).await?;
+            (client, inventory)
+        } else if password_already_changed {
+            report(&progress, "正在使用已更新的密码重新连接 Redfish");
+            let client = client.with_password(credentials.new_password.clone());
+            let inventory = client.discover().await?;
+            (client, inventory)
+        } else {
+            let inventory = client.discover().await?;
+            (client, inventory)
+        };
+
+        if let Some(account_uri) = plan.account_uri.as_deref()
+            && inventory.account.uri != account_uri
+        {
             return Err(WorkflowError::PlanChanged(
                 "selected account no longer matches the plan",
             ));
         }
         let interface = select_interface(
             &inventory,
-            Some(&plan.ethernet_interface_uri),
+            plan.ethernet_interface_uri.as_deref(),
             plan.source_ip,
-            None,
+            plan.source_mac.as_deref(),
         )?;
+        report(&progress, "Redfish 登录成功，已定位 BMC 管理网卡");
 
-        let configured_client = if plan.password_change_requested {
+        let configured_client = if plan.password_change_requested && !bootstrap {
+            report(&progress, "正在修改 BMC 管理员密码");
             client
                 .change_password(&inventory.account, &credentials.new_password)
                 .await
                 .map_err(WorkflowError::PasswordChange)?;
+            report(&progress, "BMC 管理员密码已更新");
             client.with_password(credentials.new_password)
         } else {
             client
         };
+        report(
+            &progress,
+            format!(
+                "正在写入静态 IPv4 {}/{}，网关 {}",
+                plan.target_network.address, plan.target_network.prefix, plan.target_network.gateway
+            ),
+        );
         configured_client
             .configure_static_ipv4(&interface.uri, &plan.target_network)
             .await
             .map_err(WorkflowError::NetworkConfiguration)?;
+        report(&progress, "静态 IPv4 已提交，正在等待 BMC 在新地址重连");
 
         // The password stays inside the authenticated client. Network changes can drop the
         // current connection immediately, so an unreachable target is a truthful non-success
         // outcome rather than a fabricated successful verification.
         let verification_client = configured_client.at_ipv4(plan.target_network.address)?;
-        let status = verify_after_network_change(&verification_client)
+        let status = verify_after_network_change(&verification_client, &progress)
             .await
             .map_err(WorkflowError::NetworkVerification)?;
+        report(&progress, format!("已在新地址 {} 验证 Redfish 登录", plan.target_network.address));
 
         Ok(ProvisionResult {
             status,
+            password_transitioned: bootstrap || password_already_changed,
             source_ip: plan.source_ip,
             target_ip: plan.target_network.address,
-            account_uri: plan.account_uri,
+            account_uri: inventory.account.uri,
             ethernet_interface_uri: interface.uri,
         })
     }
+}
+
+/// AMI may accept its one-time password API before the Redfish account store is ready. Retrying
+/// only transient authentication/transport failures avoids treating the successful password
+/// transition as a generic pre-change authentication error.
+async fn discover_after_initial_password_change(
+    client: &RedfishClient,
+    progress: &Option<UnboundedSender<String>>,
+) -> Result<RedfishInventory, WorkflowError> {
+    for attempt in 0..FIRST_LOGIN_SETTLE_ATTEMPTS {
+        match client.discover().await {
+            Ok(inventory) => return Ok(inventory),
+            Err(RedfishError::AuthenticationFailed | RedfishError::Request(_))
+                if attempt + 1 < FIRST_LOGIN_SETTLE_ATTEMPTS =>
+            {
+                report(
+                    progress,
+                    format!(
+                        "等待 Redfish 认证就绪（第 {}/{} 次）",
+                        attempt + 1,
+                        FIRST_LOGIN_SETTLE_ATTEMPTS
+                    ),
+                );
+                sleep(FIRST_LOGIN_SETTLE_INTERVAL).await;
+            }
+            Err(error) => return Err(WorkflowError::PostInitialPasswordChange(error)),
+        }
+    }
+    unreachable!("retry loop returns on the final attempt")
 }
 
 /// A BMC commonly drops its current HTTPS connection when its IPv4 address changes. Retry only
 /// the authenticated Service Root read at a conservative 5-second cadence for at most one minute.
 async fn verify_after_network_change(
     client: &RedfishClient,
+    progress: &Option<UnboundedSender<String>>,
 ) -> Result<ProvisionStatus, RedfishError> {
     for attempt in 0..VERIFY_ATTEMPTS {
         match client.verify_connection().await {
             Ok(()) => return Ok(ProvisionStatus::Completed),
             Err(RedfishError::Request(_)) if attempt + 1 < VERIFY_ATTEMPTS => {
+                report(
+                    progress,
+                    format!(
+                        "等待新地址 Redfish 重连（第 {}/{} 次）",
+                        attempt + 1,
+                        VERIFY_ATTEMPTS
+                    ),
+                );
                 sleep(VERIFY_INTERVAL).await;
             }
             Err(RedfishError::Request(_)) => return Ok(ProvisionStatus::NetworkChangedUnverified),
@@ -116,6 +288,12 @@ async fn verify_after_network_change(
         }
     }
     Ok(ProvisionStatus::NetworkChangedUnverified)
+}
+
+fn report(progress: &Option<UnboundedSender<String>>, message: impl Into<String>) {
+    if let Some(sender) = progress {
+        let _ = sender.send(message.into());
+    }
 }
 
 fn select_interface(
@@ -182,6 +360,12 @@ pub enum WorkflowError {
     Redfish(#[from] RedfishError),
     #[error("BMC rejected the password-change operation")]
     PasswordChange(#[source] RedfishError),
+    #[error("BMC rejected the required initial-password transition")]
+    InitialPasswordBootstrap(#[source] RedfishError),
+    #[error("BMC password changed, but Redfish did not become ready afterward")]
+    PostInitialPasswordChange(#[source] RedfishError),
+    #[error("BMC requires an initial password change; provide a new password")]
+    NewPasswordRequired,
     #[error("BMC rejected the static IPv4 configuration")]
     NetworkConfiguration(#[source] RedfishError),
     #[error("BMC network changed but Redfish verification failed")]

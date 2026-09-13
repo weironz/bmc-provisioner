@@ -502,6 +502,7 @@ mod tests {
         };
         let result = ProvisionResult {
             status: ProvisionStatus::Completed,
+            password_transitioned: false,
             source_ip: candidate().ip,
             target_ip: network.address,
             account_uri: "/redfish/v1/AccountService/Accounts/1".to_owned(),

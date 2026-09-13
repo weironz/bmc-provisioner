@@ -3,10 +3,15 @@
   import { openUrl } from '@tauri-apps/plugin-opener';
   import UpdateDialog from './lib/UpdateDialog.svelte';
 
-  const base = window.location.port === '5173' ? 'http://127.0.0.1:6770' : window.location.origin;
+  // The desktop WebView origin is a Tauri-owned asset origin, not bmc-provisionerd.
+  // Both the packaged desktop app and Vite development UI therefore use the local API
+  // service explicitly.  Using window.location.origin here makes a packaged build fetch
+  // its own HTML fallback and later try to iterate an object as the BMC candidate list.
+  const base = 'http://127.0.0.1:6770';
   type Candidate = { scopeId:number; scopeName:string; subnet:string; prefix:number; ip:string; mac?:string; source:'confirmedDiscovery'|'relayDhcpLease' };
   type Managed = { identity:string; mac?:string; scopeId:number; scopeName:string; sourceIp:string; currentIp:string; credentialProfile:string; configurationStatus:string; onlineStatus:string; redfishStatus:string; authenticationStatus:string; lastCheckedAt?:number };
   type Profile = { name:string; username:string };
+  type JobLog = { timestampMs:number; message:string };
   type Row = { identity:string; candidate?:Candidate; managed?:Managed; sourceIp:string; address:string; mac?:string; scopeName:string; subnet?:string; prefix?:number; frozen:boolean };
 
   let tab:'inventory'|'connection'|'profiles' = 'inventory';
@@ -36,6 +41,7 @@
   let message = '正在从 lessor 读取已确认 BMC。';
   let error = '';
   let progress = '';
+  let executionLogs:JobLog[] = [];
   let showAbout = false;
 
   onMount(async () => { await defaults(); await Promise.all([load(), inventory(), loadProfiles()]); });
@@ -62,14 +68,18 @@
     savingConnection = true; error='';
     try { const response = await fetch(`${base}/api/v1/settings/defaults`, {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify({lessorUrl,scopeId,username:'',targetPrefix,targetGateway})}); if (!response.ok) throw Error('无法保存全局连接设置'); message='已保存全局连接与网络默认值。'; } catch(reason) { error=reason instanceof Error ? reason.message : '保存失败'; } finally { savingConnection=false; }
   }
+  function requireArray(value:unknown, label:string): any[] {
+    if (!Array.isArray(value)) throw Error(`${label}返回了无效的数据格式，请确认桌面端本地服务已升级。`);
+    return value;
+  }
   async function load() {
     const query = new URLSearchParams({lessorUrl,scopeId:String(scopeId)});
     const response = await fetch(`${base}/api/v1/candidates?${query}`), value = await json(response);
     if (!response.ok) throw Error(value.error ?? '无法读取 lessor BMC 列表');
-    candidates=value; rebuildRows();
+    candidates=requireArray(value,'lessor BMC 列表') as Candidate[]; rebuildRows();
   }
-  async function inventory() { const response=await fetch(`${base}/api/v1/managed-bmcs`); if (!response.ok) throw Error('无法读取本地 BMC 清单'); managed=await response.json(); rebuildRows(); }
-  async function loadProfiles() { const response=await fetch(`${base}/api/v1/credential-profiles`); if (!response.ok) throw Error('无法读取凭据档案'); profiles=await response.json(); }
+  async function inventory() { const response=await fetch(`${base}/api/v1/managed-bmcs`), value=await json(response); if (!response.ok) throw Error(value.error ?? '无法读取本地 BMC 清单'); managed=requireArray(value,'本地 BMC 清单') as Managed[]; rebuildRows(); }
+  async function loadProfiles() { const response=await fetch(`${base}/api/v1/credential-profiles`), value=await json(response); if (!response.ok) throw Error(value.error ?? '无法读取凭据档案'); profiles=requireArray(value,'凭据档案') as Profile[]; }
   async function refresh() {
     loading=true; error='';
     try {
@@ -81,20 +91,32 @@
       await inventory(); message=failed.length ? `状态检查完成；${failed.join('、')} 未能完成检查。` : `已更新 ${checkable.length} 台 BMC 的在线、Redfish 与认证状态。`;
     } catch(reason) { error=reason instanceof Error ? reason.message : '刷新失败'; } finally { loading=false; progress=''; }
   }
-  async function wait(job:any) { while(['queued','running'].includes(job.state)) { await new Promise(resolve=>setTimeout(resolve,1500)); job=await json(await fetch(`${base}/api/v1/jobs/${job.id}`)); } return job; }
+  function appendExecutionLog(message:string) { executionLogs=[...executionLogs,{timestampMs:Date.now(),message}].slice(-200); }
+  function mergeJobLogs(job:any, seen:Set<string>) {
+    const entries=Array.isArray(job.logs) ? job.logs as JobLog[] : [];
+    const unseen=entries.filter(entry=>{
+      const key=`${entry.timestampMs}:${entry.message}`;
+      if(seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+    if(unseen.length) executionLogs=[...executionLogs,...unseen].slice(-200);
+  }
+  function timestamp(value:number) { return new Date(value).toLocaleTimeString('zh-CN',{hour12:false}); }
+  async function wait(job:any, seen:Set<string>) { mergeJobLogs(job,seen); while(['queued','running'].includes(job.state)) { await new Promise(resolve=>setTimeout(resolve,1500)); job=await json(await fetch(`${base}/api/v1/jobs/${job.id}`)); mergeJobLogs(job,seen); } return job; }
   async function execute() {
     const selected=rows.filter(row=>row.candidate && !row.frozen && picked[row.identity]);
     if(!selected.length || !targetGateway || selected.some(row=>!targets[row.identity] || !profileByRow[row.identity])) { error='请勾选 BMC，并为每台填写目标 IPv4、选择凭据档案。'; return; }
-    executing=true; error=''; const failed:string[]=[];
+    executing=true; error=''; executionLogs=[]; appendExecutionLog(`批量配置开始：共 ${selected.length} 台 BMC`); const failed:string[]=[];
     for(const [index,row] of selected.entries()) {
       const candidate=row.candidate!, profileName=profileByRow[row.identity]; progress=`${index+1}/${selected.length}：${candidate.ip} → ${targets[row.identity]}`;
       try {
+        appendExecutionLog(`${candidate.ip}：正在读取 HTTPS 证书并生成配置任务`);
         const certificate=await fetch(`${base}/api/v1/certificates/probe`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip})}), certificateValue:any=await json(certificate); if(!certificate.ok) throw Error(certificateValue.error ?? '无法读取 HTTPS 证书');
         const plan=await fetch(`${base}/api/v1/provision/plan`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lessorUrl,scopeId,candidateIp:candidate.ip,targetNetwork:{address:targets[row.identity],prefix:targetPrefix,gateway:targetGateway},certificateFingerprint:certificateValue.fingerprint.sha256,passwordChange:false,credentialProfile:profileName})}), planned:any=await json(plan); if(!plan.ok) throw Error(planned.details?.reason ?? planned.error ?? '无法生成内部配置');
-        const apply=await fetch(`${base}/api/v1/provision/plans/${planned.planId}/apply`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})}), submitted:any=await json(apply); if(!apply.ok) throw Error(submitted.error ?? '无法提交'); const completed=await wait(submitted); if(completed.state!=='completed') throw Error(completed.error ?? '配置失败');
-      } catch(reason) { failed.push(`${candidate.ip}：${reason instanceof Error ? reason.message : '失败'}`); }
+        const apply=await fetch(`${base}/api/v1/provision/plans/${planned.planId}/apply`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})}), submitted:any=await json(apply); if(!apply.ok) throw Error(submitted.error ?? '无法提交'); const completed=await wait(submitted,new Set<string>()); if(completed.state!=='completed') throw Error(completed.error ?? '配置失败');
+      } catch(reason) { const detail=reason instanceof Error ? reason.message : '失败'; appendExecutionLog(`${candidate.ip}：配置失败：${detail}`); failed.push(`${candidate.ip}：${detail}`); }
     }
-    await inventory(); executing=false; progress=''; message=`批量任务完成：成功 ${selected.length-failed.length} 台，失败 ${failed.length} 台。`; if(failed.length) error=failed.join('；');
+    await Promise.all([inventory(), loadProfiles()]); executing=false; progress=''; appendExecutionLog(`批量任务完成：成功 ${selected.length-failed.length} 台，失败 ${failed.length} 台`); message=`批量任务完成：成功 ${selected.length-failed.length} 台，失败 ${failed.length} 台。`; if(failed.length) error=failed.join('；');
   }
   async function selectProfile(row:Row, name:string) {
     profileByRow={...profileByRow,[row.identity]:name};
@@ -113,7 +135,7 @@
 </script>
 
 <main>
-  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.5</button></h1></div><span class="local">已连接</span></header>
+  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.6</button></h1></div><span class="local">已连接</span></header>
   <nav aria-label="主导航"><button class:active={tab==='inventory'} onclick={()=>tab='inventory'}>BMC 清单 <span>{rows.length}</span></button><button class:active={tab==='connection'} onclick={()=>tab='connection'}>连接设置</button><button class:active={tab==='profiles'} onclick={()=>tab='profiles'}>凭据档案 <span>{profiles.length}</span></button></nav>
 
   {#if tab==='inventory'}
@@ -125,6 +147,7 @@
   {:else}
     <section class="settings-page"><div class="section-title"><div><h2>凭据档案</h2><p>每个 BMC 行可选择不同档案。桌面端密码写入系统凭据管理器；Docker 部署只保留到服务重启，不会写入 SQLite。</p></div></div><div class="profile-form"><label>档案名称<input bind:value={profileName} placeholder="例如 default、rack-a"/></label><label>用户名<input bind:value={profileUsername} placeholder="root"/></label><label>当前密码<input bind:value={profileCurrentPassword} type="password"/></label><label>新密码 <small>首次强制改密时使用</small><input bind:value={profileNewPassword} type="password"/></label><button class="primary" onclick={saveProfile}>保存档案</button></div>{#if profiles.length}<div class="profile-list">{#each profiles as item}<div><span><strong>{item.name}</strong><small>{item.username} · 系统凭据管理器或当前服务会话</small></span><button class="text-danger" onclick={()=>removeProfile(item.name)}>删除</button></div>{/each}</div>{:else}<p class="muted">还没有凭据档案。先创建一个档案，再回到 BMC 清单逐行选择。</p>{/if}</section>
   {/if}
+  {#if executionLogs.length}<section class="execution-log" aria-live="polite"><div><h2>执行日志</h2><small>{executing ? '任务执行中，日志会持续更新' : '本次任务已结束'}</small></div><ol>{#each executionLogs as item}<li><time>{timestamp(item.timestampMs)}</time><span>{item.message}</span></li>{/each}</ol></section>{/if}
   <footer aria-live="polite">{#if error}<p class="error">{error}</p>{/if}<p>{message}</p></footer>
-  {#if showAbout}<UpdateDialog version="0.1.4" onclose={()=>showAbout=false}/>{/if}
+  {#if showAbout}<UpdateDialog version="0.1.6" onclose={()=>showAbout=false}/>{/if}
 </main>

@@ -2,7 +2,7 @@ use std::{net::Ipv4Addr, sync::Arc};
 
 use reqwest::{
     Response, StatusCode, Url,
-    header::{ETAG, HeaderValue, IF_MATCH},
+    header::{COOKIE, ETAG, HeaderValue, IF_MATCH, SET_COOKIE},
 };
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
@@ -121,20 +121,7 @@ impl RedfishClient {
         // BMC addresses are always contacted directly.  In a corporate environment reqwest
         // inherits HTTP(S)_PROXY by default; sending RFC1918 Redfish traffic to that proxy makes
         // a reachable BMC look like a TLS or authentication failure.
-        let client = match fingerprint {
-            Some(fingerprint) => {
-                let fingerprint = CertificateFingerprint::parse(fingerprint)?;
-                reqwest::Client::builder()
-                    .no_proxy()
-                    .use_preconfigured_tls(pinned_tls_config(Some(fingerprint)))
-                    .build()
-                    .map_err(RedfishError::Client)?
-            }
-            None => reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .map_err(RedfishError::Client)?,
-        };
+        let client = https_client(fingerprint)?;
         Self::from_client(base_url, credentials, client)
     }
 
@@ -304,13 +291,73 @@ impl RedfishClient {
         // ETag obtained from a preceding GET. Reading immediately before writing also protects
         // us from overwriting a simultaneous operator change.
         let etag = self.resource_etag(interface_uri).await?;
-        self.send_json_with_if_match(
+        let combined_result = self.send_json_with_if_match(
             reqwest::Method::PATCH,
             interface_uri,
             static_ipv4_payload(network),
-            etag,
-        )
-        .await
+            etag.clone(),
+        );
+
+        match combined_result.await {
+            Ok(()) => Ok(()),
+            // AMI SyncAgent firmware rejects a combined DHCP-disable and static-address PATCH
+            // with this specific message. Do not use this fallback for generic 400 responses:
+            // those can indicate an invalid address or a non-writable interface.
+            Err(error) if requires_separate_dhcpv4_disable(&error) => {
+                self.send_json_with_if_match(
+                    reqwest::Method::PATCH,
+                    interface_uri,
+                    dhcpv4_disable_payload(),
+                    etag,
+                )
+                .await?;
+
+                // A successful PATCH may replace the entity tag. Fetch it again before the
+                // second write so the two-step path retains the same concurrency guarantee.
+                let refreshed_etag = self.resource_etag(interface_uri).await.map_err(|error| {
+                    RedfishError::DhcpV4DisabledButStaticIpv4Incomplete(Box::new(error))
+                })?;
+                self.send_json_with_if_match(
+                    reqwest::Method::PATCH,
+                    interface_uri,
+                    static_addresses_payload(network),
+                    refreshed_etag,
+                )
+                .await
+                .map_err(|error| {
+                    RedfishError::DhcpV4DisabledButStaticIpv4Incomplete(Box::new(error))
+                })
+            }
+            // Some AMI firmware rejects the inverse combined transition with
+            // Ami.1.0.DifferentIpSeries even when the requested address and gateway share the
+            // supplied subnet. Its own registry only provides a generic message, so use this
+            // ordering only for the precise vendor MessageId: install the static address first,
+            // then disable DHCP using a refreshed ETag.
+            Err(error) if requires_static_before_dhcpv4_disable(&error) => {
+                self.send_json_with_if_match(
+                    reqwest::Method::PATCH,
+                    interface_uri,
+                    static_addresses_payload(network),
+                    etag,
+                )
+                .await?;
+
+                let refreshed_etag = self.resource_etag(interface_uri).await.map_err(|error| {
+                    RedfishError::StaticIpv4ConfiguredButDhcpV4StillEnabled(Box::new(error))
+                })?;
+                self.send_json_with_if_match(
+                    reqwest::Method::PATCH,
+                    interface_uri,
+                    dhcpv4_disable_payload(),
+                    refreshed_etag,
+                )
+                .await
+                .map_err(|error| {
+                    RedfishError::StaticIpv4ConfiguredButDhcpV4StillEnabled(Box::new(error))
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// A short authenticated request used after the network address has changed.
@@ -403,6 +450,164 @@ impl RedfishClient {
     }
 }
 
+/// Detect the narrowly scoped AMI first-login API before considering its use.  This does not
+/// authenticate and does not modify the BMC.  A normal Redfish implementation never needs it.
+pub async fn ami_web_first_login_supported(
+    ip: Ipv4Addr,
+    fingerprint: Option<&str>,
+) -> Result<bool, RedfishError> {
+    let client = AmiWebFirstLoginClient::for_ipv4(ip, fingerprint)?;
+    client.supported().await
+}
+
+/// Change an AMI BMC's factory password only after the public UI signature has been verified.
+/// The firmware blocks the standard Redfish ManagerAccount resource in this state, so this is a
+/// deliberately small bridge back to the normal Redfish workflow rather than a general web API.
+pub async fn reset_ami_web_initial_password(
+    ip: Ipv4Addr,
+    credentials: &Credentials,
+    fingerprint: Option<&str>,
+) -> Result<(), RedfishError> {
+    let client = AmiWebFirstLoginClient::for_ipv4(ip, fingerprint)?;
+    client.reset_password(credentials).await
+}
+
+fn https_client(fingerprint: Option<&str>) -> Result<reqwest::Client, RedfishError> {
+    match fingerprint {
+        Some(fingerprint) => {
+            let fingerprint = CertificateFingerprint::parse(fingerprint)?;
+            reqwest::Client::builder()
+                .no_proxy()
+                .use_preconfigured_tls(pinned_tls_config(Some(fingerprint)))
+                .build()
+                .map_err(RedfishError::Client)
+        }
+        None => reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(RedfishError::Client),
+    }
+}
+
+struct AmiWebFirstLoginClient {
+    base_url: Url,
+    client: reqwest::Client,
+}
+
+impl AmiWebFirstLoginClient {
+    fn for_ipv4(ip: Ipv4Addr, fingerprint: Option<&str>) -> Result<Self, RedfishError> {
+        let base_url = Url::parse(&format!("https://{ip}/")).map_err(RedfishError::InvalidUrl)?;
+        Ok(Self {
+            base_url,
+            client: https_client(fingerprint)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_mock(base_url: Url) -> Self {
+        assert_eq!(
+            base_url.scheme(),
+            "http",
+            "mock AMI API must use local HTTP"
+        );
+        Self {
+            base_url,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn supported(&self) -> Result<bool, RedfishError> {
+        let response = self
+            .client
+            .get(self.url("/source.min.js")?)
+            .send()
+            .await
+            .map_err(RedfishError::Request)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let response = ensure_success(response).await?;
+        let script = response.text().await.map_err(RedfishError::Decode)?;
+        Ok(script.contains("/api/session") && script.contains("/api/updatenew_password"))
+    }
+
+    async fn reset_password(&self, credentials: &Credentials) -> Result<(), RedfishError> {
+        if !self.supported().await? {
+            return Err(RedfishError::AmiWebBootstrapUnsupported);
+        }
+        let response = self
+            .client
+            .post(self.url("/api/session")?)
+            .form(&[
+                ("username", credentials.username.as_str()),
+                ("password", credentials.current_password.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(RedfishError::Request)?;
+        let response = ensure_success(response).await?;
+        let cookie = response_cookie(&response).ok_or(RedfishError::AmiWebBootstrapRejected)?;
+        let login: Value = response.json().await.map_err(RedfishError::Decode)?;
+        let csrf = login
+            .get("CSRFToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or(RedfishError::AmiWebBootstrapRejected)?;
+        if login.get("passwordStatus").and_then(Value::as_i64) != Some(1) {
+            return Err(RedfishError::AmiWebBootstrapRejected);
+        }
+
+        let result = self
+            .client
+            .post(self.url("/api/updatenew_password")?)
+            .header(COOKIE, &cookie)
+            .header("X-CSRFTOKEN", csrf)
+            .form(&[
+                ("password", credentials.new_password.as_str()),
+                ("username", credentials.username.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(RedfishError::Request)?;
+        let result = ensure_success(result).await?;
+        let result: Value = result.json().await.map_err(RedfishError::Decode)?;
+        let accepted = result
+            .get("code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| (code as u64 & 0xff) == 0);
+        if !accepted {
+            return Err(RedfishError::AmiWebBootstrapRejected);
+        }
+
+        // Do not retain the privileged browser-like session.  Logout is best effort because the
+        // password change may invalidate it immediately; its failure cannot undo the change.
+        let _ = self
+            .client
+            .delete(self.url("/api/session")?)
+            .header(COOKIE, &cookie)
+            .header("X-CSRFTOKEN", csrf)
+            .send()
+            .await;
+        Ok(())
+    }
+
+    fn url(&self, path: &str) -> Result<Url, RedfishError> {
+        self.base_url.join(path).map_err(RedfishError::InvalidUrl)
+    }
+}
+
+fn response_cookie(response: &Response) -> Option<String> {
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .filter(|value| value.contains('='))
+        .collect();
+    (!cookies.is_empty()).then(|| cookies.join("; "))
+}
+
 #[derive(Debug)]
 struct PinnedCertificateVerifier {
     expected: Option<CertificateFingerprint>,
@@ -474,12 +679,46 @@ fn pinned_tls_config(fingerprint: Option<CertificateFingerprint>) -> ClientConfi
 fn static_ipv4_payload(network: &StaticNetwork) -> Value {
     json!({
         "DHCPv4": { "DHCPEnabled": false },
-        "IPv4StaticAddresses": [{
+        "IPv4StaticAddresses": static_addresses(network),
+    })
+}
+
+fn dhcpv4_disable_payload() -> Value {
+    json!({ "DHCPv4": { "DHCPEnabled": false } })
+}
+
+fn static_addresses_payload(network: &StaticNetwork) -> Value {
+    json!({
+        "IPv4StaticAddresses": static_addresses(network),
+    })
+}
+
+fn static_addresses(network: &StaticNetwork) -> Value {
+    json!([{
             "Address": network.address.to_string(),
             "SubnetMask": network.subnet_mask_string(),
             "Gateway": network.gateway.to_string(),
-        }],
-    })
+    }])
+}
+
+fn requires_separate_dhcpv4_disable(error: &RedfishError) -> bool {
+    matches!(
+        error,
+        RedfishError::UnexpectedStatus {
+            status: StatusCode::BAD_REQUEST,
+            message_id: Some(message_id),
+        } if message_id == "SyncAgent.1.0.DisableDHCPv4"
+    )
+}
+
+fn requires_static_before_dhcpv4_disable(error: &RedfishError) -> bool {
+    matches!(
+        error,
+        RedfishError::UnexpectedStatus {
+            status: StatusCode::BAD_REQUEST,
+            message_id: Some(message_id),
+        } if message_id == "Ami.1.0.DifferentIpSeries"
+    )
 }
 
 async fn ensure_success(response: Response) -> Result<Response, RedfishError> {
@@ -546,6 +785,10 @@ pub enum RedfishError {
     Request(#[source] reqwest::Error),
     #[error("BMC authentication failed")]
     AuthenticationFailed,
+    #[error("this BMC does not expose the supported AMI first-login password API")]
+    AmiWebBootstrapUnsupported,
+    #[error("BMC rejected the AMI first-login password change")]
+    AmiWebBootstrapRejected,
     #[error(
         "Redfish returned HTTP {status}{message_id}",
         message_id = message_id
@@ -557,6 +800,10 @@ pub enum RedfishError {
         status: StatusCode,
         message_id: Option<String>,
     },
+    #[error("BMC accepted DHCPv4 disable, but static IPv4 configuration did not complete")]
+    DhcpV4DisabledButStaticIpv4Incomplete(#[source] Box<RedfishError>),
+    #[error("BMC accepted static IPv4, but DHCPv4 disable did not complete")]
+    StaticIpv4ConfiguredButDhcpV4StillEnabled(#[source] Box<RedfishError>),
     #[error("Redfish returned an unexpected response")]
     Decode(#[source] reqwest::Error),
     #[error("the Redfish account for {0:?} was not found")]
@@ -646,7 +893,7 @@ mod tests {
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path},
+        matchers::{body_json, header, method, path},
     };
 
     fn credentials() -> Credentials {
@@ -785,6 +1032,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_ami_dhcp_disable_with_two_etag_protected_patches() {
+        let server = MockServer::start().await;
+        let interface = "/redfish/v1/Managers/BMC/EthernetInterfaces/eth0";
+        let network = StaticNetwork {
+            address: Ipv4Addr::new(10, 10, 1, 9),
+            prefix: 24,
+            gateway: Ipv4Addr::new(10, 10, 1, 1),
+        };
+
+        Mock::given(method("GET"))
+            .and(path(interface))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "Id": "eth0" }))
+                    .insert_header("etag", "\"resource-version-1\""),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(interface))
+            .and(header("if-match", "\"resource-version-1\""))
+            .and(body_json(static_ipv4_payload(&network)))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "@Message.ExtendedInfo": [{
+                        "MessageId": "SyncAgent.1.0.DisableDHCPv4"
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(interface))
+            .and(header("if-match", "\"resource-version-1\""))
+            .and(body_json(dhcpv4_disable_payload()))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(interface))
+            .and(header("if-match", "\"resource-version-1\""))
+            .and(body_json(static_addresses_payload(&network)))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        client
+            .configure_static_ipv4(interface, &network)
+            .await
+            .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn retries_ami_different_ip_series_by_writing_static_before_disabling_dhcp() {
+        let server = MockServer::start().await;
+        let interface = "/redfish/v1/Managers/BMC/EthernetInterfaces/eth0";
+        let network = StaticNetwork {
+            address: Ipv4Addr::new(10, 10, 1, 31),
+            prefix: 24,
+            gateway: Ipv4Addr::new(10, 10, 1, 254),
+        };
+
+        Mock::given(method("GET"))
+            .and(path(interface))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "Id": "eth0" }))
+                    .insert_header("etag", "\"resource-version-1\""),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(interface))
+            .and(header("if-match", "\"resource-version-1\""))
+            .and(body_json(static_ipv4_payload(&network)))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "@Message.ExtendedInfo": [{
+                        "MessageId": "Ami.1.0.DifferentIpSeries"
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(interface))
+            .and(header("if-match", "\"resource-version-1\""))
+            .and(body_json(static_addresses_payload(&network)))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(interface))
+            .and(header("if-match", "\"resource-version-1\""))
+            .and(body_json(dhcpv4_disable_payload()))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        client
+            .configure_static_ipv4(interface, &network)
+            .await
+            .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn uses_change_password_action_when_bmc_requires_it() {
         let server = MockServer::start().await;
         mock_discovery(&server, true, true).await;
@@ -805,6 +1172,68 @@ mod tests {
             .await
             .unwrap();
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn changes_ami_first_login_password_only_after_matching_public_api_signature() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/source.min.js"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("url:\"/api/session\";url:\"/api/updatenew_password\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/session"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "QSESSIONID=opaque; HttpOnly")
+                    .set_body_json(json!({
+                        "passwordStatus": 1,
+                        "CSRFToken": "opaque-csrf-token"
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/updatenew_password"))
+            .and(header("cookie", "QSESSIONID=opaque"))
+            .and(header("x-csrftoken", "opaque-csrf-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "code": 0 })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/session"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AmiWebFirstLoginClient::new_for_mock(Url::parse(&server.uri()).unwrap());
+        assert!(client.supported().await.unwrap());
+        client.reset_password(&credentials()).await.unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn refuses_ami_bootstrap_when_the_public_signature_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/source.min.js"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("unrelated javascript"))
+            .mount(&server)
+            .await;
+
+        let client = AmiWebFirstLoginClient::new_for_mock(Url::parse(&server.uri()).unwrap());
+        assert!(!client.supported().await.unwrap());
+        assert!(matches!(
+            client.reset_password(&credentials()).await,
+            Err(RedfishError::AmiWebBootstrapUnsupported)
+        ));
     }
 
     #[test]

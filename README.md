@@ -16,6 +16,7 @@
 - [开发计划](docs/development-plan.md)
 - [本地 API](docs/api.md)
 - [Docker Compose 部署指引](docs/deployment.md)
+- [ASRR 8U16X GNR2 B300 首次登录兼容说明](docs/asrr-8u16x-gnr2-b300-first-login.md)
 
 > 这是独立项目。lessor 只负责 DHCP 与 BMC IPMI 发现；本项目不修改 lessor
 > 的配置，也不承载 DHCP 服务。
