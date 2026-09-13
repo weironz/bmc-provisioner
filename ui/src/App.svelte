@@ -35,6 +35,7 @@
   let profileUsername = '';
   let profileCurrentPassword = '';
   let profileNewPassword = '';
+  let restoreProfileName = '';
   let loading = false;
   let executing = false;
   let savingConnection = false;
@@ -128,6 +129,7 @@
   async function saveAddress(item:Managed) { const response=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(item.identity)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({currentIp:editAddress})}), value:any=await json(response); if(!response.ok){error=value.error??'无法更新访问地址';return;} editing='';await inventory();message='已更新本地访问地址。'; }
   async function remove(item:Managed) { if(!confirm(`删除本地清单中的 ${item.currentIp}？不会修改 BMC。`))return; const response=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(item.identity)}`,{method:'DELETE'});if(!response.ok){error='无法删除本地清单记录';return;}await inventory();message='已删除本地清单记录。'; }
   async function saveProfile() { if(!profileName || !profileUsername || !profileCurrentPassword){error='请填写档案名称、用户名和当前密码。';return;} const response=await fetch(`${base}/api/v1/credential-profiles`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:profileName,username:profileUsername,currentPassword:profileCurrentPassword,newPassword:profileNewPassword})});if(!response.ok){error='无法保存凭据档案';return;}profileName='';profileUsername='';profileCurrentPassword='';profileNewPassword='';await loadProfiles();message='凭据档案已安全保存到 Windows 凭据管理器。'; }
+  async function restoreProfile() { if(!restoreProfileName.trim()){error='请输入需要恢复的档案名称。';return;} error=''; const name=restoreProfileName.trim(), response=await fetch(`${base}/api/v1/credential-profiles/${encodeURIComponent(name)}/restore`,{method:'POST'}), value=await json(response); if(!response.ok){error=value.error??'没有找到对应的系统凭据档案。';return;} restoreProfileName='';await loadProfiles();message=`已恢复凭据档案 ${value.name}；密码未显示、导出或改写。`; }
   async function removeProfile(name:string) { if(!confirm(`删除凭据档案 ${name}？已关联的 BMC 将不能再自动检查或配置。`))return;const response=await fetch(`${base}/api/v1/credential-profiles/${encodeURIComponent(name)}`,{method:'DELETE'});if(!response.ok){error='无法删除凭据档案';return;}await loadProfiles();message='已删除凭据档案。'; }
   function setTarget(identity:string,value:string){targets={...targets,[identity]:value};} function choose(identity:string,value:boolean){picked={...picked,[identity]:value};}
   async function open(ip:string){try{if('__TAURI_INTERNALS__' in window)await openUrl(`https://${ip}`);else window.open(`https://${ip}`,'_blank')}catch{error='无法使用默认浏览器打开 BMC 地址'}}
@@ -135,7 +137,7 @@
 </script>
 
 <main>
-  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.6</button></h1></div><span class="local">已连接</span></header>
+  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.7</button></h1></div><span class="local">已连接</span></header>
   <nav aria-label="主导航"><button class:active={tab==='inventory'} onclick={()=>tab='inventory'}>BMC 清单 <span>{rows.length}</span></button><button class:active={tab==='connection'} onclick={()=>tab='connection'}>连接设置</button><button class:active={tab==='profiles'} onclick={()=>tab='profiles'}>凭据档案 <span>{profiles.length}</span></button></nav>
 
   {#if tab==='inventory'}
@@ -145,9 +147,9 @@
   {:else if tab==='connection'}
     <section class="settings-page"><div class="section-title"><div><h2>连接设置</h2><p>lessor 是全局的 BMC 动态发现来源。</p></div></div><div class="setting-grid"><label>lessor 地址<input bind:value={lessorUrl} placeholder="http://127.0.0.1:8080"/></label><label>作用域 ID<input bind:value={scopeId} type="number" min="1"/></label></div><div class="setting-grid network"><label>默认 IPv4 前缀<input bind:value={targetPrefix} type="number" min="1" max="32"/></label><label>默认网关<input bind:value={targetGateway} placeholder="172.16.40.254"/></label></div><button class="primary" onclick={saveConnection} disabled={savingConnection}>{savingConnection?'保存中…':'保存连接设置'}</button></section>
   {:else}
-    <section class="settings-page"><div class="section-title"><div><h2>凭据档案</h2><p>每个 BMC 行可选择不同档案。桌面端密码写入系统凭据管理器；Docker 部署只保留到服务重启，不会写入 SQLite。</p></div></div><div class="profile-form"><label>档案名称<input bind:value={profileName} placeholder="例如 default、rack-a"/></label><label>用户名<input bind:value={profileUsername} placeholder="root"/></label><label>当前密码<input bind:value={profileCurrentPassword} type="password"/></label><label>新密码 <small>首次强制改密时使用</small><input bind:value={profileNewPassword} type="password"/></label><button class="primary" onclick={saveProfile}>保存档案</button></div>{#if profiles.length}<div class="profile-list">{#each profiles as item}<div><span><strong>{item.name}</strong><small>{item.username} · 系统凭据管理器或当前服务会话</small></span><button class="text-danger" onclick={()=>removeProfile(item.name)}>删除</button></div>{/each}</div>{:else}<p class="muted">还没有凭据档案。先创建一个档案，再回到 BMC 清单逐行选择。</p>{/if}</section>
+    <section class="settings-page"><div class="section-title"><div><h2>凭据档案</h2><p>档案名称和用户名保存到本机数据目录；桌面端密码仅保存到 Windows 凭据管理器。Docker 使用当前服务会话，服务重启后需要重新填写密码。</p></div></div><div class="profile-form"><label>档案名称<input bind:value={profileName} placeholder="例如 default、rack-a"/></label><label>用户名<input bind:value={profileUsername} placeholder="root"/></label><label>当前密码<input bind:value={profileCurrentPassword} type="password"/></label><label>新密码 <small>首次强制改密时使用</small><input bind:value={profileNewPassword} type="password"/></label><button class="primary" onclick={saveProfile}>保存档案</button></div><div class="profile-recovery"><span><strong>恢复已有 Windows 档案</strong><small>升级前的密码仍在凭据管理器时，输入原档案名即可恢复其名称和用户名；不会显示、导出或改写密码。</small></span><input bind:value={restoreProfileName} placeholder="例如 asrr-default" onkeydown={event=>{if(event.key==='Enter')void restoreProfile()}}/><button class="secondary" onclick={restoreProfile}>恢复档案</button></div>{#if profiles.length}<div class="profile-list">{#each profiles as item}<div><span><strong>{item.name}</strong><small>{item.username} · 系统凭据管理器或当前服务会话</small></span><button class="text-danger" onclick={()=>removeProfile(item.name)}>删除</button></div>{/each}</div>{:else}<p class="muted">还没有凭据档案。先创建一个档案，或恢复已有的 Windows 档案，再回到 BMC 清单逐行选择。</p>{/if}</section>
   {/if}
   {#if executionLogs.length}<section class="execution-log" aria-live="polite"><div><h2>执行日志</h2><small>{executing ? '任务执行中，日志会持续更新' : '本次任务已结束'}</small></div><ol>{#each executionLogs as item}<li><time>{timestamp(item.timestampMs)}</time><span>{item.message}</span></li>{/each}</ol></section>{/if}
   <footer aria-live="polite">{#if error}<p class="error">{error}</p>{/if}<p>{message}</p></footer>
-  {#if showAbout}<UpdateDialog version="0.1.6" onclose={()=>showAbout=false}/>{/if}
+  {#if showAbout}<UpdateDialog version="0.1.7" onclose={()=>showAbout=false}/>{/if}
 </main>

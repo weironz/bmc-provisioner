@@ -73,7 +73,9 @@ pub struct InventoryStore {
 
 impl InventoryStore {
     pub fn open_default() -> Result<Self, StoreError> {
-        let path = default_database_path()?;
+        let base = local_application_data_directory()?;
+        let path = database_path(&base);
+        migrate_legacy_database(&base, &path)?;
         Self::open(&path)
     }
 
@@ -439,12 +441,40 @@ fn ensure_managed_bmc_column(
     Ok(())
 }
 
-fn default_database_path() -> Result<PathBuf, StoreError> {
-    let base = std::env::var_os("LOCALAPPDATA")
+const DATA_DIRECTORY: &str = "bmc-provisioner-data";
+const LEGACY_DATA_DIRECTORY: &str = "bmc-provisioner";
+const DATABASE_FILE: &str = "inventory.sqlite3";
+
+fn local_application_data_directory() -> Result<PathBuf, StoreError> {
+    std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .ok_or(StoreError::NoDataDirectory)?;
-    Ok(base.join("bmc-provisioner").join("inventory.sqlite3"))
+        .ok_or(StoreError::NoDataDirectory)
+}
+
+fn database_path(base: &Path) -> PathBuf {
+    base.join(DATA_DIRECTORY).join(DATABASE_FILE)
+}
+
+fn legacy_database_path(base: &Path) -> PathBuf {
+    base.join(LEGACY_DATA_DIRECTORY).join(DATABASE_FILE)
+}
+
+/// Versions up to v0.1.6 stored state alongside the Windows updater's installation files.
+/// Copy (rather than move) the old database once so a running legacy process is never disrupted.
+fn migrate_legacy_database(base: &Path, destination: &Path) -> Result<(), StoreError> {
+    if destination.exists() {
+        return Ok(());
+    }
+    let legacy = legacy_database_path(base);
+    if !legacy.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(StoreError::Directory)?;
+    }
+    fs::copy(legacy, destination).map_err(StoreError::Migration)?;
+    Ok(())
 }
 
 fn timestamp() -> i64 {
@@ -460,6 +490,8 @@ pub enum StoreError {
     Directory(#[source] std::io::Error),
     #[error("could not open inventory database")]
     Database(#[source] rusqlite::Error),
+    #[error("could not migrate legacy inventory database")]
+    Migration(#[source] std::io::Error),
     #[error("inventory database lock was poisoned")]
     Lock,
     #[error("no local application-data directory is available")]
@@ -552,5 +584,33 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         drop(store);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_legacy_database_outside_the_updater_install_directory() {
+        let base = std::env::temp_dir().join(format!("bmc-provisioner-data-{}", Uuid::new_v4()));
+        let legacy = legacy_database_path(&base);
+        let legacy_store = InventoryStore::open(&legacy).unwrap();
+        legacy_store
+            .save_credential_profiles(&[CredentialProfileMeta {
+                name: "rack-a".to_owned(),
+                username: "admin".to_owned(),
+            }])
+            .unwrap();
+        drop(legacy_store);
+
+        let destination = database_path(&base);
+        migrate_legacy_database(&base, &destination).unwrap();
+        assert!(destination.is_file());
+        assert!(legacy.is_file());
+        let profiles = InventoryStore::open(&destination)
+            .unwrap()
+            .credential_profiles()
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "rack-a");
+        assert_eq!(profiles[0].username, "admin");
+
+        let _ = fs::remove_dir_all(base);
     }
 }

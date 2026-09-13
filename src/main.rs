@@ -296,6 +296,10 @@ async fn main() {
             "/api/v1/credential-profiles/{name}",
             get(load_credential_profile).delete(delete_credential_profile),
         )
+        .route(
+            "/api/v1/credential-profiles/{name}/restore",
+            post(restore_credential_profile),
+        )
         // The service itself only listens on loopback. This permits the Vite development UI to
         // call it from a different loopback port; the packaged desktop UI will be same-origin.
         .layer(CorsLayer::very_permissive())
@@ -1016,6 +1020,36 @@ async fn save_credential_profile(
         .save_credential_profiles(&profiles)
         .map_err(inventory_api_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rebuilds the non-secret SQLite metadata for a profile that still exists in the OS vault.
+/// The secret is read only inside this process to obtain its user name; it is never returned,
+/// logged, or rewritten by this endpoint.
+async fn restore_credential_profile(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CredentialProfileMeta>, ApiError> {
+    let name = valid_profile_name(&name)?;
+    let secret = profile_secret(&state, &name).await?;
+    let profile = CredentialProfileMeta {
+        name: name.clone(),
+        username: secret.username,
+    };
+    let mut profiles = state
+        .inventory
+        .credential_profiles()
+        .map_err(inventory_api_error)?;
+    if let Some(existing) = profiles.iter_mut().find(|existing| existing.name == name) {
+        *existing = profile.clone();
+    } else {
+        profiles.push(profile.clone());
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    state
+        .inventory
+        .save_credential_profiles(&profiles)
+        .map_err(inventory_api_error)?;
+    Ok(Json(profile))
 }
 
 async fn delete_credential_profile(
