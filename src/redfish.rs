@@ -39,7 +39,19 @@ pub struct EthernetInterface {
     pub name: Option<String>,
     pub mac_address: Option<String>,
     pub ipv4_addresses: Vec<Ipv4Addr>,
+    pub dhcp_v4_enabled: Option<bool>,
+    pub ipv4_static_addresses: Vec<StaticIpv4Address>,
     pub link_status: Option<String>,
+}
+
+/// The address details returned by a Redfish EthernetInterface for a static IPv4 setting.
+/// All fields except the address are optional because several BMC implementations omit them.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticIpv4Address {
+    pub address: Ipv4Addr,
+    pub subnet_mask: Option<Ipv4Addr>,
+    pub gateway: Option<Ipv4Addr>,
 }
 
 /// SHA-256 fingerprint of the leaf certificate currently served by a BMC.
@@ -242,8 +254,20 @@ impl RedfishClient {
                 mac_address: interface.mac_address,
                 ipv4_addresses: interface
                     .ipv4_addresses
-                    .into_iter()
+                    .iter()
                     .filter_map(|address| address.address)
+                    .collect(),
+                dhcp_v4_enabled: interface.dhcp_v4.and_then(|dhcp_v4| dhcp_v4.dhcp_enabled),
+                ipv4_static_addresses: interface
+                    .ipv4_static_addresses
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry.address.map(|address| StaticIpv4Address {
+                            address,
+                            subnet_mask: entry.subnet_mask,
+                            gateway: entry.gateway,
+                        })
+                    })
                     .collect(),
                 link_status: interface.link_status,
             });
@@ -916,6 +940,10 @@ struct EthernetInterfaceResponse {
     mac_address: Option<String>,
     #[serde(rename = "IPv4Addresses", default)]
     ipv4_addresses: Vec<Ipv4Address>,
+    #[serde(rename = "DHCPv4")]
+    dhcp_v4: Option<DhcpV4>,
+    #[serde(rename = "IPv4StaticAddresses", default)]
+    ipv4_static_addresses: Vec<Ipv4Address>,
     #[serde(rename = "LinkStatus")]
     link_status: Option<String>,
 }
@@ -924,6 +952,16 @@ struct EthernetInterfaceResponse {
 struct Ipv4Address {
     #[serde(rename = "Address")]
     address: Option<Ipv4Addr>,
+    #[serde(rename = "SubnetMask")]
+    subnet_mask: Option<Ipv4Addr>,
+    #[serde(rename = "Gateway")]
+    gateway: Option<Ipv4Addr>,
+}
+
+#[derive(Deserialize)]
+struct DhcpV4 {
+    #[serde(rename = "DHCPEnabled")]
+    dhcp_enabled: Option<bool>,
 }
 
 #[cfg(test)]
@@ -994,7 +1032,10 @@ mod tests {
         let interfaces = json!({ "Members": [{ "@odata.id": "/redfish/v1/Managers/BMC/EthernetInterfaces/eth0" }] });
         let interface = json!({
             "Id": "eth0", "Name": "BMC management", "MACAddress": "00:11:22:33:44:55",
-            "IPv4Addresses": [{ "Address": "192.168.1.10" }], "LinkStatus": "LinkUp"
+            "IPv4Addresses": [{ "Address": "192.168.1.10" }],
+            "DHCPv4": { "DHCPEnabled": false },
+            "IPv4StaticAddresses": [{ "Address": "192.168.1.10", "SubnetMask": "255.255.255.0", "Gateway": "192.168.1.1" }],
+            "LinkStatus": "LinkUp"
         });
 
         for (resource, body) in [
@@ -1051,6 +1092,14 @@ mod tests {
             "/redfish/v1/AccountService/Accounts/admin"
         );
         assert_eq!(inventory.ethernet_interfaces[0].id, "eth0");
+        assert_eq!(
+            inventory.ethernet_interfaces[0].dhcp_v4_enabled,
+            Some(false)
+        );
+        assert_eq!(
+            inventory.ethernet_interfaces[0].ipv4_static_addresses[0].gateway,
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
         client
             .change_password(&inventory.account, "new-password")
             .await

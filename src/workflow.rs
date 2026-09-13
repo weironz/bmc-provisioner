@@ -331,7 +331,7 @@ fn report_network_change_submitted(progress: &Option<UnboundedSender<WorkflowPro
     }
 }
 
-fn select_interface(
+pub fn select_interface(
     inventory: &RedfishInventory,
     requested_interface_uri: Option<&str>,
     source_ip: Ipv4Addr,

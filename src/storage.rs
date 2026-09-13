@@ -274,6 +274,45 @@ impl InventoryStore {
         Ok(())
     }
 
+    /// Adopt an already-static controller after an authenticated, read-only Redfish check.
+    /// This is local bookkeeping only: it never sends a PATCH to the BMC.
+    pub fn record_adopted_static(
+        &self,
+        candidate: &BmcCandidate,
+        network: &StaticNetwork,
+        fingerprint: Option<&str>,
+        credential_profile: &str,
+    ) -> Result<ManagedBmc, StoreError> {
+        let identity = identity(candidate);
+        let now = timestamp();
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        connection.execute(
+            "INSERT INTO managed_bmcs (
+                identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
+                target_prefix, target_gateway, certificate_fingerprint, configuration_status,
+                online_status, redfish_status, authentication_status, last_checked_at,
+                last_configured_at, last_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7, ?8, ?9, 'adopted_static',
+                      'online', 'reachable', 'success', ?10, ?10, NULL)
+            ON CONFLICT(identity) DO UPDATE SET
+                mac=excluded.mac, scope_id=excluded.scope_id, scope_name=excluded.scope_name,
+                credential_profile=excluded.credential_profile, source_ip=excluded.source_ip,
+                current_ip=excluded.current_ip, target_ip=excluded.target_ip,
+                target_prefix=excluded.target_prefix, target_gateway=excluded.target_gateway,
+                certificate_fingerprint=excluded.certificate_fingerprint,
+                configuration_status='adopted_static', online_status='online',
+                redfish_status='reachable', authentication_status='success',
+                last_checked_at=excluded.last_checked_at, last_configured_at=excluded.last_configured_at,
+                last_error=NULL",
+            params![
+                identity, candidate.mac, candidate.scope_id, candidate.scope_name, credential_profile,
+                candidate.ip.to_string(), i64::from(network.prefix), network.gateway.to_string(), fingerprint, now,
+            ],
+        ).map_err(StoreError::Database)?;
+        drop(connection);
+        self.find(&identity)?.ok_or(StoreError::MissingRecord)
+    }
+
     pub fn record_health(
         &self,
         identity: &str,
@@ -365,6 +404,24 @@ impl InventoryStore {
                  redfish_status='unknown', authentication_status='unknown', last_checked_at=NULL
                  WHERE identity=?1",
                 params![identity, current_ip.to_string()],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        self.find(identity)?.ok_or(StoreError::MissingRecord)
+    }
+
+    /// Re-enable a frozen local item for a deliberate future provisioning run.
+    pub fn mark_for_reprovision(&self, identity: &str) -> Result<ManagedBmc, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute(
+                "UPDATE managed_bmcs SET configuration_status='pending_reconfiguration',
+             online_status='unknown', redfish_status='unknown', authentication_status='unknown',
+             last_checked_at=NULL, last_error=NULL WHERE identity=?1",
+                [identity],
             )
             .map_err(StoreError::Database)?;
         drop(connection);

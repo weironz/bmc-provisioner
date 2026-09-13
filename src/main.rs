@@ -18,7 +18,7 @@ use bmc_provisioner::{
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
     redfish::{CertificateFingerprint, EthernetInterface, RedfishClient, probe_certificate},
     storage::{CredentialProfileMeta, InventoryStore, ManagedBmc, ProvisionDefaults},
-    workflow::{ProvisionWorkflow, WorkflowProgress},
+    workflow::{ProvisionWorkflow, WorkflowProgress, select_interface},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -162,6 +162,34 @@ struct CertificateProbeResponse {
     fingerprint: CertificateFingerprint,
 }
 
+/// A read-only, authenticated assessment of a lessor candidate's current BMC network mode.
+/// The only durable side effect is adopting an already-static controller into local inventory.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateNetworkInspectionRequest {
+    lessor_url: String,
+    scope_id: u64,
+    candidate_ip: Ipv4Addr,
+    credential_profile: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateNetworkInspectionResponse {
+    candidate: BmcCandidate,
+    mode: CandidateNetworkMode,
+    managed: Option<ManagedBmc>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CandidateNetworkMode {
+    Dhcp,
+    Static,
+    StaticDetailsIncomplete,
+    Unknown,
+}
+
 /// Explicitly entered by the operator. This type is accepted only by read-only diagnostic routes;
 /// it is deliberately not accepted by provisioning plan/apply routes.
 #[derive(Deserialize)]
@@ -238,6 +266,7 @@ struct CreateManagedBmcRequest {
 struct UpdateManagedBmcRequest {
     current_ip: Option<Ipv4Addr>,
     credential_profile: Option<String>,
+    allow_reprovision: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -337,6 +366,10 @@ async fn main() {
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/candidates", get(candidates))
+        .route(
+            "/api/v1/candidates/inspect-network",
+            post(inspect_candidate_network),
+        )
         .route("/api/v1/certificates/probe", post(probe_bmc_certificate))
         .route(
             "/api/v1/diagnostics/redfish/certificate",
@@ -468,6 +501,94 @@ async fn probe_bmc_certificate(
         candidate,
         fingerprint,
     }))
+}
+
+/// Reads a candidate's Redfish EthernetInterface and adopts it only when the BMC itself confirms
+/// a complete static IPv4 configuration. It deliberately performs no account or network mutation.
+async fn inspect_candidate_network(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CandidateNetworkInspectionRequest>,
+) -> Result<Json<CandidateNetworkInspectionResponse>, ApiError> {
+    let candidate =
+        provisioning_candidate(&request.lessor_url, request.scope_id, request.candidate_ip).await?;
+    let credential_profile = valid_profile_name(&request.credential_profile)?;
+    let credentials = credentials_for_profile(state.as_ref(), &credential_profile).await?;
+    let fingerprint = probe_certificate(candidate.ip).await.map_err(|error| {
+        tracing::warn!(error = %error, ip = %candidate.ip, "could not inspect BMC certificate for network adoption");
+        ApiError::unprocessable("could not read a usable HTTPS certificate from this BMC")
+    })?;
+    let client = RedfishClient::for_ipv4_with_fingerprint(
+        candidate.ip,
+        &credentials,
+        Some(&fingerprint.sha256),
+    )
+    .map_err(workflow_redfish_api_error)?;
+    let inventory = client
+        .discover()
+        .await
+        .map_err(workflow_redfish_api_error)?;
+    let interface = select_interface(&inventory, None, candidate.ip, candidate.mac.as_deref())
+        .map_err(workflow_api_error)?;
+
+    if interface.dhcp_v4_enabled == Some(true) {
+        return Ok(Json(CandidateNetworkInspectionResponse {
+            candidate,
+            mode: CandidateNetworkMode::Dhcp,
+            managed: None,
+        }));
+    }
+    if interface.dhcp_v4_enabled != Some(false) {
+        return Ok(Json(CandidateNetworkInspectionResponse {
+            candidate,
+            mode: CandidateNetworkMode::Unknown,
+            managed: None,
+        }));
+    }
+    let Some(network) = observed_static_network(&interface, candidate.ip) else {
+        return Ok(Json(CandidateNetworkInspectionResponse {
+            candidate,
+            mode: CandidateNetworkMode::StaticDetailsIncomplete,
+            managed: None,
+        }));
+    };
+    let managed = state
+        .inventory
+        .record_adopted_static(
+            &candidate,
+            &network,
+            Some(&fingerprint.sha256),
+            &credential_profile,
+        )
+        .map_err(inventory_api_error)?;
+    Ok(Json(CandidateNetworkInspectionResponse {
+        candidate,
+        mode: CandidateNetworkMode::Static,
+        managed: Some(managed),
+    }))
+}
+
+fn observed_static_network(
+    interface: &EthernetInterface,
+    current_ip: Ipv4Addr,
+) -> Option<StaticNetwork> {
+    let entry = interface
+        .ipv4_static_addresses
+        .iter()
+        .find(|entry| entry.address == current_ip)?;
+    Some(StaticNetwork {
+        address: entry.address,
+        prefix: prefix_from_subnet_mask(entry.subnet_mask?)?,
+        gateway: entry.gateway?,
+    })
+}
+
+fn prefix_from_subnet_mask(mask: Ipv4Addr) -> Option<u8> {
+    let bits = u32::from(mask);
+    let prefix = bits.leading_ones() as u8;
+    if prefix == 0 {
+        return (bits == 0).then_some(0);
+    }
+    (bits == (!0u32 << (32 - u32::from(prefix)))).then_some(prefix)
 }
 
 /// This does not require a lessor candidate because the IP was explicitly entered by the user.
@@ -984,6 +1105,12 @@ async fn update_managed_bmc(
         managed = state
             .inventory
             .set_credential_profile(&identity, &profile)
+            .map_err(inventory_api_error)?;
+    }
+    if request.allow_reprovision.unwrap_or(false) {
+        managed = state
+            .inventory
+            .mark_for_reprovision(&identity)
             .map_err(inventory_api_error)?;
     }
     Ok(Json(managed))
