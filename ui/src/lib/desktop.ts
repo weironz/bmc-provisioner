@@ -2,6 +2,17 @@
 export const inDesktop = () =>
   typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
+/**
+ * The Tauri bundle manifest is the single source of truth for a desktop build.
+ * Do not duplicate this value in the UI: a stale literal makes a successfully
+ * updated installer appear to still be on its previous version.
+ */
+export async function desktopVersion() {
+  if (!inDesktop()) return null;
+  const { getVersion } = await import('@tauri-apps/api/app');
+  return getVersion();
+}
+
 export async function checkUpdate() {
   if (!inDesktop()) return null;
   const { check } = await import('@tauri-apps/plugin-updater');

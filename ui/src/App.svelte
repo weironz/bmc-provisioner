@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import UpdateDialog from './lib/UpdateDialog.svelte';
+  import { desktopVersion } from './lib/desktop';
 
   // The desktop WebView origin is a Tauri-owned asset origin, not bmc-provisionerd.
   // Both the packaged desktop app and Vite development UI therefore use the local API
@@ -46,8 +47,13 @@
   let progress = '';
   let executionLogs:JobLog[] = [];
   let showAbout = false;
+  let currentVersion = $state('…');
 
-  onMount(async () => { await defaults(); await Promise.all([load(), inventory(), loadProfiles()]); });
+  onMount(async () => {
+    currentVersion = await desktopVersion() ?? '浏览器版';
+    await defaults();
+    await Promise.all([load(), inventory(), loadProfiles()]);
+  });
 
   async function json(response:Response) { try { return await response.json(); } catch { return {}; } }
   function identityFor(candidate:Candidate) { return (candidate.mac ?? `scope-${candidate.scopeId}-ip-${candidate.ip}`).toLowerCase(); }
@@ -167,7 +173,7 @@
 </script>
 
 <main>
-  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v0.1.7</button></h1></div><span class="local">已连接</span></header>
+  <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v{currentVersion}</button></h1></div><span class="local">已连接</span></header>
   <nav aria-label="主导航"><button class:active={tab==='inventory'} onclick={()=>tab='inventory'}>BMC 清单 <span>{rows.length}</span></button><button class:active={tab==='connection'} onclick={()=>tab='connection'}>连接设置</button><button class:active={tab==='profiles'} onclick={()=>tab='profiles'}>凭据档案 <span>{profiles.length}</span></button></nav>
 
   {#if tab==='inventory'}
@@ -181,5 +187,5 @@
   {/if}
   {#if executionLogs.length}<section class="execution-log" aria-live="polite"><div><h2>执行日志</h2><small>{executing ? '任务执行中，日志会持续更新' : '本次任务已结束'}</small></div><ol>{#each executionLogs as item}<li><time>{timestamp(item.timestampMs)}</time><span>{item.message}</span></li>{/each}</ol></section>{/if}
   <footer aria-live="polite">{#if error}<p class="error">{error}</p>{/if}<p>{message}</p></footer>
-  {#if showAbout}<UpdateDialog version="0.1.7" onclose={()=>showAbout=false}/>{/if}
+  {#if showAbout}<UpdateDialog version={currentVersion} onclose={()=>showAbout=false}/>{/if}
 </main>
