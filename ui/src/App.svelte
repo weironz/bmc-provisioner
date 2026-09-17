@@ -10,49 +10,72 @@
   // its own HTML fallback and later try to iterate an object as the BMC candidate list.
   const base = 'http://127.0.0.1:6770';
   type Candidate = { scopeId:number; scopeName:string; subnet:string; prefix:number; ip:string; mac?:string; source:'confirmedDiscovery'|'relayDhcpLease' };
-  type Managed = { identity:string; mac?:string; scopeId:number; scopeName:string; sourceIp:string; currentIp:string; credentialProfile:string; configurationStatus:string; onlineStatus:string; redfishStatus:string; authenticationStatus:string; lastCheckedAt?:number };
+  type Managed = { identity:string; displayName:string; clusterId?:number; mac?:string; scopeId:number; scopeName:string; sourceIp:string; currentIp:string; credentialProfile:string; configurationStatus:string; onlineStatus:string; redfishStatus:string; authenticationStatus:string; lastCheckedAt?:number };
   type Profile = { name:string; username:string };
+  type Cluster = { id:number; name:string; createdAt:number };
   type JobLog = { timestampMs:number; message:string };
+  type PowerAction = 'on'|'shutdown'|'restart';
+  type PowerStatus = { systemUri:string; powerState?:string; supportedActions:PowerAction[] };
+  type ManagedPowerStatus = { managed:Managed; power?:PowerStatus; certificateFingerprint?:{sha256:string}; certificateTrustRequired:boolean; detail?:string };
   type Row = { identity:string; candidate?:Candidate; managed?:Managed; sourceIp:string; address:string; mac?:string; scopeName:string; subnet?:string; prefix?:number; frozen:boolean };
 
-  let tab:'inventory'|'connection'|'profiles' = 'inventory';
-  let lessorUrl = 'http://127.0.0.1:8080';
-  let scopeId = 1;
-  let targetPrefix = 24;
-  let targetGateway = '';
-  let batchConcurrency = 4;
-  let candidates:Candidate[] = [];
-  let managed:Managed[] = [];
-  let profiles:Profile[] = [];
-  let rows:Row[] = [];
-  let targets:Record<string,string> = {};
-  let picked:Record<string,boolean> = {};
-  let profileByRow:Record<string,string> = {};
-  let manualIp = '';
-  let manualMac = '';
-  let manualProfile = '';
-  let editing = '';
-  let editAddress = '';
-  let profileName = '';
-  let profileUsername = '';
-  let profileCurrentPassword = '';
-  let profileNewPassword = '';
-  let restoreProfileName = '';
-  let loading = false;
-  let inspecting = false;
-  let executing = false;
-  let savingConnection = false;
-  let message = '正在从 lessor 读取已确认 BMC。';
-  let error = '';
-  let progress = '';
-  let executionLogs:JobLog[] = [];
-  let showAbout = false;
+  let tab = $state<'inventory'|'connection'|'profiles'|'management'|'clusters'>('inventory');
+  let lessorUrl = $state('http://127.0.0.1:8080');
+  let scopeId = $state(1);
+  let targetPrefix = $state(24);
+  let targetGateway = $state('');
+  let batchConcurrency = $state(4);
+  let candidates = $state<Candidate[]>([]);
+  let managed = $state<Managed[]>([]);
+  let profiles = $state<Profile[]>([]);
+  let clusters = $state<Cluster[]>([]);
+  let rows = $state<Row[]>([]);
+  let targets = $state<Record<string,string>>({});
+  let picked = $state<Record<string,boolean>>({});
+  let profileByRow = $state<Record<string,string>>({});
+  let manualIp = $state('');
+  let manualMac = $state('');
+  let manualProfile = $state('');
+  let editing = $state('');
+  let editAddress = $state('');
+  let profileName = $state('');
+  let profileUsername = $state('');
+  let profileCurrentPassword = $state('');
+  let profileNewPassword = $state('');
+  let restoreProfileName = $state('');
+  let loading = $state(false);
+  let inspecting = $state(false);
+  let executing = $state(false);
+  let savingConnection = $state(false);
+  let message = $state('正在从 lessor 读取已确认 BMC。');
+  let error = $state('');
+  let progress = $state('');
+  let executionLogs = $state<JobLog[]>([]);
+  let showAbout = $state(false);
   let currentVersion = $state('…');
+  let managementPicked = $state<Record<string,boolean>>({});
+  let managementStatus = $state<Record<string,ManagedPowerStatus>>({});
+  let managementBusy = $state(false);
+  let managementAddName = $state('');
+  let managementAddIp = $state('');
+  let managementAddMac = $state('');
+  let managementAddProfile = $state('');
+  let managementEditing = $state('');
+  let managementEditName = $state('');
+  let managementEditIp = $state('');
+  let managementEditProfile = $state('');
+  let managementClusterFilter = $state('all');
+  let managementBatchCluster = $state('');
+  let managementAddCluster = $state('');
+  let managementEditCluster = $state('');
+  let clusterName = $state('');
+  let editingCluster = $state<number|undefined>();
+  let clusterEditName = $state('');
 
   onMount(async () => {
     currentVersion = await desktopVersion() ?? '浏览器版';
     await defaults();
-    await Promise.all([load(), inventory(), loadProfiles()]);
+    await Promise.all([load(), inventory(), loadProfiles(), loadClusters()]);
   });
 
   async function json(response:Response) { try { return await response.json(); } catch { return {}; } }
@@ -88,12 +111,13 @@
     if (!response.ok) throw Error(value.error ?? '无法读取 lessor BMC 列表');
     candidates=requireArray(value,'lessor BMC 列表') as Candidate[]; rebuildRows();
   }
-  async function inventory() { const response=await fetch(`${base}/api/v1/managed-bmcs`), value=await json(response); if (!response.ok) throw Error(value.error ?? '无法读取本地 BMC 清单'); managed=requireArray(value,'本地 BMC 清单') as Managed[]; rebuildRows(); }
+  async function inventory() { const response=await fetch(`${base}/api/v1/managed-bmcs`), value=await json(response); if (!response.ok) throw Error(value.error ?? '无法读取本地 BMC 清单'); managed=requireArray(value,'本地 BMC 清单') as Managed[]; managementPicked=Object.fromEntries(managed.map(item=>[item.identity,managementPicked[item.identity]??false])); rebuildRows(); }
   async function loadProfiles() { const response=await fetch(`${base}/api/v1/credential-profiles`), value=await json(response); if (!response.ok) throw Error(value.error ?? '无法读取凭据档案'); profiles=requireArray(value,'凭据档案') as Profile[]; }
+  async function loadClusters() { const response=await fetch(`${base}/api/v1/clusters`), value=await json(response); if (!response.ok) throw Error(value.error ?? '无法读取集群'); clusters=requireArray(value,'集群') as Cluster[]; }
   async function refresh() {
     loading=true; error='';
     try {
-      await Promise.all([load(), inventory(), loadProfiles()]);
+      await Promise.all([load(), inventory(), loadProfiles(), loadClusters()]);
       const checkable=managed.filter(item => item.credentialProfile && profiles.some(profile => profile.name === item.credentialProfile));
       if (!checkable.length) { message = managed.length ? '请先为清单中的 BMC 选择一个凭据档案。' : candidates.length ? `已读取 ${candidates.length} 台待配置 BMC。` : '当前没有 BMC。'; return; }
       const failed:string[]=[];
@@ -167,6 +191,57 @@
   async function saveProfile() { if(!profileName || !profileUsername || !profileCurrentPassword){error='请填写档案名称、用户名和当前密码。';return;} const response=await fetch(`${base}/api/v1/credential-profiles`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:profileName,username:profileUsername,currentPassword:profileCurrentPassword,newPassword:profileNewPassword})});if(!response.ok){error='无法保存凭据档案';return;}profileName='';profileUsername='';profileCurrentPassword='';profileNewPassword='';await loadProfiles();message='凭据档案已安全保存到 Windows 凭据管理器。'; }
   async function restoreProfile() { if(!restoreProfileName.trim()){error='请输入需要恢复的档案名称。';return;} error=''; const name=restoreProfileName.trim(), response=await fetch(`${base}/api/v1/credential-profiles/${encodeURIComponent(name)}/restore`,{method:'POST'}), value=await json(response); if(!response.ok){error=value.error??'没有找到对应的系统凭据档案。';return;} restoreProfileName='';await loadProfiles();message=`已恢复凭据档案 ${value.name}；密码未显示、导出或改写。`; }
   async function removeProfile(name:string) { if(!confirm(`删除凭据档案 ${name}？已关联的 BMC 将不能再自动检查或配置。`))return;const response=await fetch(`${base}/api/v1/credential-profiles/${encodeURIComponent(name)}`,{method:'DELETE'});if(!response.ok){error='无法删除凭据档案';return;}await loadProfiles();message='已删除凭据档案。'; }
+  function chooseManaged(identity:string,value:boolean){managementPicked={...managementPicked,[identity]:value};}
+  function clusterFor(item:Managed) { return clusters.find(cluster=>cluster.id===item.clusterId); }
+  function clusterLabel(item:Managed) { return clusterFor(item)?.name ?? '未分配集群'; }
+  function clusterSize(clusterId:number) { return managed.filter(item=>item.clusterId===clusterId).length; }
+  function filteredManaged() { return managementClusterFilter==='all' ? managed : managementClusterFilter==='unassigned' ? managed.filter(item=>!item.clusterId) : managed.filter(item=>item.clusterId===Number(managementClusterFilter)); }
+  function allFilteredManagedPicked() { const visible=filteredManaged(); return visible.length>0 && visible.every(item=>managementPicked[item.identity]); }
+  function chooseAllFilteredManaged(value:boolean) { managementPicked={...managementPicked,...Object.fromEntries(filteredManaged().map(item=>[item.identity,value]))}; }
+  function pickedManaged() { return managed.filter(item=>managementPicked[item.identity]); }
+  async function managementStatusOne(item:Managed, trustCertificate=false) {
+    const response=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(item.identity)}/power/status`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({trustCertificate})});
+    const value:any=await json(response);
+    if(!response.ok) throw Error(value.error??'无法读取 BMC 管理状态');
+    managementStatus={...managementStatus,[item.identity]:value as ManagedPowerStatus};
+  }
+  async function refreshManagement(only?:Managed) {
+    const items=only?[only]:managed;
+    if(!items.length){message='还没有本地 BMC 清单；可先手动加入，或从 lessor 发现后执行配置。';return;}
+    managementBusy=true; error=''; const failed:string[]=[];
+    try { await runWithLimit(items,Math.min(batchConcurrency,4),async(item,index)=>{progress=`检查 ${index+1}/${items.length}：${item.currentIp}`;try{await managementStatusOne(item);}catch(reason){const detail=reason instanceof Error?reason.message:'状态检查失败';managementStatus={...managementStatus,[item.identity]:{managed:item,certificateTrustRequired:false,detail}};failed.push(item.currentIp);}}); await inventory(); message=failed.length?`状态刷新完成；${failed.length} 台未能读取 Redfish 状态。`:`已更新 ${items.length} 台 BMC 的在线、Redfish、认证和电源状态。`; if(failed.length)error=`无法检查：${failed.join('、')}`; } finally {managementBusy=false;progress='';}
+  }
+  async function trustManagementCertificate(item:Managed) {
+    const pending=managementStatus[item.identity]; const fingerprint=pending?.certificateFingerprint?.sha256;
+    if(!fingerprint || !confirm(`确认信任 ${item.currentIp} 的 BMC HTTPS 证书？\nSHA-256：${fingerprint}`)) return;
+    managementBusy=true; error='';
+    try { await managementStatusOne(item,true); await inventory(); message=`已保存 ${item.currentIp} 的证书指纹，并读取 Redfish 电源能力。`; } catch(reason) { error=reason instanceof Error?reason.message:'无法确认 BMC 证书'; } finally { managementBusy=false; }
+  }
+  function supportsPower(item:Managed,action:PowerAction) { return managementStatus[item.identity]?.power?.supportedActions.includes(action)??false; }
+  async function executeManagementPower(action:PowerAction) {
+    const selected=managed.filter(item=>managementPicked[item.identity]);
+    if(!selected.length){error='请至少勾选一台 BMC。';return;}
+    const eligible=selected.filter(item=>supportsPower(item,action));
+    if(!eligible.length){error='所选 BMC 尚未完成状态探测，或其 Redfish 未声明支持此操作。';return;}
+    const names:{[key in PowerAction]:string}={on:'开机',shutdown:'关机',restart:'重启'};
+    if(!confirm(`确认对 ${eligible.length} 台 BMC 执行批量${names[action]}？\n仅会发送 Redfish 电源操作，不修改网络或凭据。`)) return;
+    managementBusy=true; error=''; const failed:string[]=[];
+    try { await runWithLimit(eligible,Math.min(batchConcurrency,4),async(item,index)=>{progress=`${names[action]} ${index+1}/${eligible.length}：${item.currentIp}`;const response=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(item.identity)}/power`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action})}),value:any=await json(response);if(!response.ok){failed.push(`${item.currentIp}：${value.error??'操作失败'}`);return;}const previous=managementStatus[item.identity];managementStatus={...managementStatus,[item.identity]:{managed:value.managed,power:previous?.power,certificateTrustRequired:false,detail:`已提交${names[action]}（${value.command.resetType}）`}};}); await inventory(); message=`批量${names[action]}已提交：成功 ${eligible.length-failed.length} 台，失败 ${failed.length} 台。`;if(failed.length)error=failed.join('；'); } finally {managementBusy=false;progress='';}
+  }
+  async function addManagementBmc() {
+    if(!managementAddIp){error='请填写 BMC IPv4 地址。';return;}
+    const response=await fetch(`${base}/api/v1/managed-bmcs`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({currentIp:managementAddIp,mac:managementAddMac||undefined,scopeName:'BMC 管理',displayName:managementAddName||undefined})}), value:any=await json(response);
+    if(!response.ok){error=value.error??'无法加入 BMC 清单';return;}
+    if(managementAddProfile||managementAddCluster){const updated=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(value.identity)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({credentialProfile:managementAddProfile||undefined,clusterId:managementAddCluster?Number(managementAddCluster):undefined})});if(!updated.ok){error='BMC 已加入，但凭据档案或集群归属未保存';}}
+    managementAddName='';managementAddIp='';managementAddMac='';managementAddProfile='';managementAddCluster='';await inventory();message='已加入本地 BMC 管理清单。';
+  }
+  function beginManagementEdit(item:Managed){managementEditing=item.identity;managementEditName=item.displayName;managementEditIp=item.currentIp;managementEditProfile=profiles.some(profile=>profile.name===item.credentialProfile)?item.credentialProfile:'';managementEditCluster=item.clusterId?String(item.clusterId):'';}
+  async function saveManagementEdit(item:Managed){const response=await fetch(`${base}/api/v1/managed-bmcs/${encodeURIComponent(item.identity)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({displayName:managementEditName,currentIp:managementEditIp,credentialProfile:managementEditProfile||undefined,clusterId:managementEditCluster?Number(managementEditCluster):null})}),value:any=await json(response);if(!response.ok){error=value.error??'无法保存 BMC 条目';return;}managementEditing='';await inventory();message='已更新本地 BMC 管理条目。';}
+  async function assignPickedManagedToCluster(){const selected=pickedManaged(),clusterId=Number(managementBatchCluster),cluster=clusters.find(item=>item.id===clusterId);if(!selected.length){error='请先勾选要加入集群的 BMC。';return;}if(!cluster){error='请选择目标集群。';return;}managementBusy=true;error='';try{const response=await fetch(`${base}/api/v1/managed-bmcs/batch/cluster`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({identities:selected.map(item=>item.identity),clusterId})}),value:any=await json(response);if(!response.ok)throw Error(value.error??'无法批量设置集群归属');managementPicked={...managementPicked,...Object.fromEntries(selected.map(item=>[item.identity,false]))};await inventory();message=`已将 ${value.updated} 台 BMC 加入集群 ${cluster.name}。`;}catch(reason){error=reason instanceof Error?reason.message:'无法批量设置集群归属';}finally{managementBusy=false;}}
+  async function createCluster() { if(!clusterName.trim()){error='请填写集群名称。';return;} const response=await fetch(`${base}/api/v1/clusters`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:clusterName})}),value:any=await json(response);if(!response.ok){error=value.error??'无法创建集群';return;}clusterName='';await loadClusters();message=`已创建集群 ${value.name}。`; }
+  function beginClusterEdit(cluster:Cluster){editingCluster=cluster.id;clusterEditName=cluster.name;}
+  async function saveCluster(cluster:Cluster){const response=await fetch(`${base}/api/v1/clusters/${cluster.id}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({name:clusterEditName})}),value:any=await json(response);if(!response.ok){error=value.error??'无法更新集群';return;}editingCluster=undefined;await loadClusters();message=`已更新集群 ${value.name}。`;}
+  async function removeCluster(cluster:Cluster){const count=clusterSize(cluster.id);if(!confirm(`删除集群 ${cluster.name}？${count?`其中 ${count} 台 BMC 会变为未分配集群，BMC 条目和历史不会删除。`:''}`))return;const response=await fetch(`${base}/api/v1/clusters/${cluster.id}`,{method:'DELETE'});if(!response.ok){error='无法删除集群';return;}if(managementClusterFilter===String(cluster.id))managementClusterFilter='all';await Promise.all([loadClusters(),inventory()]);message='已删除集群；成员 BMC 已保留为未分配状态。';}
   function setTarget(identity:string,value:string){targets={...targets,[identity]:value};} function choose(identity:string,value:boolean){picked={...picked,[identity]:value};}
   async function open(ip:string){try{if('__TAURI_INTERNALS__' in window)await openUrl(`https://${ip}`);else window.open(`https://${ip}`,'_blank')}catch{error='无法使用默认浏览器打开 BMC 地址'}}
   const label=(value:string)=>({online:'在线',offline:'离线',reachable:'可用',unreachable:'不可达',success:'成功',failed:'失败',unknown:'未检查',completed:'已完成',adopted_static:'已纳管·静态 IP',pending_reconfiguration:'待重新配置',manual:'手动记录',network_changed_unverified:'已变更，待验证'} as Record<string,string>)[value]??value;
@@ -174,12 +249,18 @@
 
 <main>
   <header><div><h1>bmc-provisioner <button class="version" onclick={()=>showAbout=true}>v{currentVersion}</button></h1></div><span class="local">已连接</span></header>
-  <nav aria-label="主导航"><button class:active={tab==='inventory'} onclick={()=>tab='inventory'}>BMC 清单 <span>{rows.length}</span></button><button class:active={tab==='connection'} onclick={()=>tab='connection'}>连接设置</button><button class:active={tab==='profiles'} onclick={()=>tab='profiles'}>凭据档案 <span>{profiles.length}</span></button></nav>
+  <nav aria-label="主导航"><button class:active={tab==='inventory'} onclick={()=>tab='inventory'}>BMC 清单 <span>{rows.length}</span></button><button class:active={tab==='management'} onclick={()=>tab='management'}>BMC 管理 <span>{managed.length}</span></button><button class:active={tab==='clusters'} onclick={()=>tab='clusters'}>集群 <span>{clusters.length}</span></button><button class:active={tab==='connection'} onclick={()=>tab='connection'}>连接设置</button><button class:active={tab==='profiles'} onclick={()=>tab='profiles'}>凭据档案 <span>{profiles.length}</span></button></nav>
 
   {#if tab==='inventory'}
     <section class="workspace"><div class="section-title"><div><h2>BMC 清单与访问状态</h2><p>来自 lessor 的动态发现与本地配置记录会按 MAC 合并；Relay 租约将在执行前由 Redfish 确认。</p></div><button onclick={refresh} disabled={loading||executing}>{loading?(progress||'刷新中…'):'刷新并检查状态'}</button></div>
     {#if rows.length}<div class="bmc-table"><div class="bmc-row table-heading"><span>选择 / BMC</span><span>MAC / 作用域</span><span>凭据档案</span><span>目标静态 IPv4 / 访问</span><span>状态</span></div>{#each rows as row}<div class:frozen={row.frozen} class="bmc-row"><label class="pick"><input type="checkbox" checked={picked[row.identity]} disabled={row.frozen||!row.candidate} onchange={event=>choose(row.identity,event.currentTarget.checked)}/><span><strong>{row.frozen?row.address:row.sourceIp}</strong><small>{row.frozen?`已冻结；来源 ${row.sourceIp}`:row.candidate?candidateLabel(row.candidate):'本地历史记录'}</small></span></label><span><code>{row.mac??'MAC 未返回'}</code><small>{row.scopeName}{row.subnet?` / ${row.subnet}/${row.prefix}`:''}</small></span><select value={profileByRow[row.identity]??''} onchange={event=>selectProfile(row,event.currentTarget.value)}><option value="">选择档案</option>{#each profiles as item}<option value={item.name}>{item.name} · {item.username}</option>{/each}</select><span>{#if row.managed&&editing===row.managed.identity}<input bind:value={editAddress}/><button onclick={()=>saveAddress(row.managed!)}>保存</button>{:else}<input value={targets[row.identity]??''} disabled={row.frozen||!row.candidate} oninput={event=>setTarget(row.identity,event.currentTarget.value)} placeholder="例如 172.16.40.200"/>{#if row.managed}<a href={`https://${row.address}`} onclick={event=>{event.preventDefault();void open(row.address)}}>https://{row.address}</a>{/if}{/if}</span>{#if row.managed}<span><strong>{label(row.managed.configurationStatus)}{row.frozen?' · 已冻结':''}</strong><small>{label(row.managed.onlineStatus)} / {label(row.managed.redfishStatus)} / {label(row.managed.authenticationStatus)}</small><span class="row-actions"><button onclick={()=>{editing=row.managed!.identity;editAddress=row.managed!.currentIp}}>编辑地址</button>{#if row.frozen}<button onclick={()=>reprovision(row.managed!)}>重新配置</button>{/if}<button class="text-danger" onclick={()=>remove(row.managed!)}>删除</button></span></span>{:else}<span><strong>待配置</strong><small>需先核验或执行配置</small></span>{/if}</div>{/each}</div><div class="batch-bar"><span>目标网络：/{targetPrefix}，网关 {targetGateway||'未设置'}</span><button class="secondary" onclick={inspectSelected} disabled={executing||inspecting}>{inspecting?(progress||'核验中…'):'核验并纳管已勾选 BMC'}</button><button class="danger" onclick={execute} disabled={executing||inspecting}>执行已勾选 BMC 的 IP 变更配置</button></div>{:else}<p class="muted">尚未读取到 BMC；请检查 lessor 连接设置。</p>{/if}
     <div class="manual-add"><strong>手动加入清单</strong><input bind:value={manualIp} placeholder="BMC IPv4，例如 172.16.40.200"/><input bind:value={manualMac} placeholder="MAC（可选）"/><select bind:value={manualProfile}><option value="">凭据档案（可选）</option>{#each profiles as item}<option value={item.name}>{item.name}</option>{/each}</select><button class="secondary" onclick={addManual}>加入清单</button></div></section>
+  {:else if tab==='management'}
+    <section class="workspace"><div class="section-title"><div><h2>BMC 管理</h2><p>本地清单是稳定数据源。按集群归类后，先刷新状态并确认首次证书，再执行电源操作。</p></div><button onclick={()=>refreshManagement()} disabled={managementBusy}>{managementBusy?(progress||'检查中…'):'刷新管理状态'}</button></div><div class="management-filter"><label>集群筛选<select bind:value={managementClusterFilter}><option value="all">全部集群</option><option value="unassigned">未分配集群</option>{#each clusters as cluster}<option value={String(cluster.id)}>{cluster.name}（{clusterSize(cluster.id)}）</option>{/each}</select></label><small>集群仅是本地管理归属，不会改变 lessor、DHCP 或 BMC 网络配置。</small></div>
+    {#if filteredManaged().length}<div class="bmc-table management-table"><div class="bmc-row table-heading"><label class="pick select-all"><input type="checkbox" checked={allFilteredManagedPicked()} onchange={event=>chooseAllFilteredManaged(event.currentTarget.checked)}/><span>全选当前筛选结果</span></label><span>BMC / MAC</span><span>凭据档案</span><span>在线 / Redfish / 认证</span><span>电源状态 / 操作</span></div>{#each filteredManaged() as item}<div class="bmc-row"><label class="pick"><input type="checkbox" checked={managementPicked[item.identity]} onchange={event=>chooseManaged(item.identity,event.currentTarget.checked)}/><span><strong>{item.displayName||item.currentIp}</strong><small>{clusterLabel(item)} · {item.displayName?item.currentIp:'未命名服务器'}</small></span></label><span><a href={`https://${item.currentIp}`} onclick={event=>{event.preventDefault();void open(item.currentIp)}}>https://{item.currentIp}</a><small><code>{item.mac??'MAC 未设置'}</code> · {item.scopeName}</small></span>{#if managementEditing===item.identity}<span><select bind:value={managementEditProfile}><option value="">保持原档案</option>{#each profiles as profile}<option value={profile.name}>{profile.name} · {profile.username}</option>{/each}</select></span>{:else}<span><strong>{item.credentialProfile||'未选择'}</strong><small>凭据档案</small></span>{/if}<span><strong>{label(item.onlineStatus)} / {label(item.redfishStatus)} / {label(item.authenticationStatus)}</strong>{#if managementStatus[item.identity]?.certificateTrustRequired}<small>需确认 HTTPS 证书</small><button class="secondary compact" onclick={()=>trustManagementCertificate(item)}>信任证书并读取</button>{:else}<small>{managementStatus[item.identity]?.detail??'尚未刷新电源状态'}</small>{/if}</span><span>{#if managementEditing===item.identity}<div class="edit-management"><input bind:value={managementEditName} placeholder="服务器名称（可选）"/><input bind:value={managementEditIp} placeholder="BMC IPv4"/><select bind:value={managementEditCluster}><option value="">未分配集群</option>{#each clusters as cluster}<option value={String(cluster.id)}>{cluster.name}</option>{/each}</select><button class="secondary compact" onclick={()=>saveManagementEdit(item)}>保存</button><button class="compact" onclick={()=>managementEditing=''}>取消</button></div>{:else}<strong>{managementStatus[item.identity]?.power?.powerState??'未读取'}</strong><small>{managementStatus[item.identity]?.power?.systemUri??'刷新状态后显示 Redfish ComputerSystem'}</small><span class="row-actions"><button class="compact" disabled={managementBusy||!supportsPower(item,'on')} onclick={()=>executeManagementPower('on')}>开机</button><button class="compact" disabled={managementBusy||!supportsPower(item,'shutdown')} onclick={()=>executeManagementPower('shutdown')}>关机</button><button class="compact" disabled={managementBusy||!supportsPower(item,'restart')} onclick={()=>executeManagementPower('restart')}>重启</button><button class="compact" onclick={()=>beginManagementEdit(item)}>编辑</button><button class="text-danger compact" onclick={()=>remove(item)}>删除</button></span>{/if}</span></div>{/each}</div><div class="batch-bar management-actions"><span><select bind:value={managementBatchCluster} aria-label="批量加入集群"><option value="">选择目标集群</option>{#each clusters as cluster}<option value={String(cluster.id)}>{cluster.name}</option>{/each}</select><button class="secondary" disabled={managementBusy||!managementBatchCluster} onclick={assignPickedManagedToCluster}>将已勾选 {pickedManaged().length} 台加入集群</button></span><span><button class="secondary" disabled={managementBusy} onclick={()=>executeManagementPower('on')}>批量开机</button><button class="danger" disabled={managementBusy} onclick={()=>executeManagementPower('shutdown')}>批量关机</button><button class="danger" disabled={managementBusy} onclick={()=>executeManagementPower('restart')}>批量重启</button></span></div>{:else}<p class="muted">当前筛选没有 BMC。可切换集群筛选，或直接手动加入。</p>{/if}
+    <div class="management-add"><strong>手动加入 BMC</strong><input bind:value={managementAddName} placeholder="服务器名称（可选）"/><input bind:value={managementAddIp} placeholder="BMC IPv4，例如 172.16.40.18"/><input bind:value={managementAddMac} placeholder="MAC（可选）"/><select bind:value={managementAddCluster}><option value="">集群（可选）</option>{#each clusters as cluster}<option value={String(cluster.id)}>{cluster.name}</option>{/each}</select><select bind:value={managementAddProfile}><option value="">凭据档案（可选）</option>{#each profiles as profile}<option value={profile.name}>{profile.name} · {profile.username}</option>{/each}</select><button class="secondary" onclick={addManagementBmc}>加入管理</button></div></section>
+  {:else if tab==='clusters'}
+    <section class="workspace"><div class="section-title"><div><h2>集群</h2><p>集群仅保存名称，用于组织 BMC。BMC 条目保存集群归属，lessor 刷新不会覆盖它。</p></div></div><div class="cluster-create"><label>集群名称<input bind:value={clusterName} placeholder="例如 B300-训练集群-A"/></label><button class="primary" onclick={createCluster}>新建集群</button></div>{#if clusters.length}<div class="cluster-list">{#each clusters as cluster}<div class="cluster-row">{#if editingCluster===cluster.id}<div class="cluster-edit"><input bind:value={clusterEditName}/><button class="secondary" onclick={()=>saveCluster(cluster)}>保存</button><button onclick={()=>editingCluster=undefined}>取消</button></div>{:else}<span><strong>{cluster.name}</strong><small>{clusterSize(cluster.id)} 台 BMC</small></span><span class="row-actions"><button onclick={()=>{managementClusterFilter=String(cluster.id);tab='management'}}>查看 BMC</button><button onclick={()=>beginClusterEdit(cluster)}>编辑</button><button class="text-danger" onclick={()=>removeCluster(cluster)}>删除</button></span>{/if}</div>{/each}</div>{:else}<p class="muted">还没有集群。可按业务、机柜或任意名称创建集群。</p>{/if}</section>
   {:else if tab==='connection'}
     <section class="settings-page"><div class="section-title"><div><h2>连接设置</h2><p>lessor 是全局的 BMC 动态发现来源。批量写入默认最多同时处理 4 台；新地址验证不占用写入配额。</p></div></div><div class="setting-grid"><label>lessor 地址<input bind:value={lessorUrl} placeholder="http://127.0.0.1:8080"/></label><label>作用域 ID<input bind:value={scopeId} type="number" min="1"/></label></div><div class="setting-grid network"><label>默认 IPv4 前缀<input bind:value={targetPrefix} type="number" min="1" max="32"/></label><label>默认网关<input bind:value={targetGateway} placeholder="172.16.40.254"/></label><label>批量写入并发<select bind:value={batchConcurrency}><option value={1}>1 台（串行）</option><option value={2}>2 台</option><option value={4}>4 台（默认）</option><option value={8}>8 台</option></select></label></div><button class="primary" onclick={saveConnection} disabled={savingConnection}>{savingConnection?'保存中…':'保存连接设置'}</button></section>
   {:else}

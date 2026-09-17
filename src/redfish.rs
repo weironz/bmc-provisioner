@@ -9,7 +9,7 @@ use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -42,6 +42,35 @@ pub struct EthernetInterface {
     pub dhcp_v4_enabled: Option<bool>,
     pub ipv4_static_addresses: Vec<StaticIpv4Address>,
     pub link_status: Option<String>,
+}
+
+/// Operator-friendly power intents.  Firmware-specific Redfish ResetType values are resolved
+/// only after reading the selected ComputerSystem's AllowableValues.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerAction {
+    On,
+    Shutdown,
+    Restart,
+}
+
+/// Read-only power capability returned by a BMC's ComputerSystem resource.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowerStatus {
+    pub system_uri: String,
+    pub power_state: Option<String>,
+    pub supported_actions: Vec<PowerAction>,
+}
+
+/// A successful reset request. Redfish may apply it asynchronously, so callers should refresh
+/// PowerStatus rather than assuming the immediately returned state has already changed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowerCommandResult {
+    pub system_uri: String,
+    pub requested_action: PowerAction,
+    pub reset_type: String,
 }
 
 /// The address details returned by a Redfish EthernetInterface for a static IPv4 setting.
@@ -279,6 +308,61 @@ impl RedfishClient {
         Ok(RedfishInventory {
             account,
             ethernet_interfaces,
+        })
+    }
+
+    /// Discover the first standard ComputerSystem exposed by this BMC and report only the
+    /// actions that its own AllowableValues permit. This keeps a B300 implementation safe while
+    /// naturally declining unsupported operations on other firmware.
+    pub async fn power_status(&self) -> Result<PowerStatus, RedfishError> {
+        let system = self.power_system().await?;
+        Ok(PowerStatus {
+            system_uri: system.uri,
+            power_state: system.power_state,
+            supported_actions: supported_power_actions(&system.allowable_reset_types),
+        })
+    }
+
+    /// Request a power transition using the vendor-advertised ComputerSystem.Reset target.
+    /// Never construct an action URI or blindly send a B300 ResetType: both come from Redfish.
+    pub async fn set_power(&self, action: PowerAction) -> Result<PowerCommandResult, RedfishError> {
+        let system = self.power_system().await?;
+        let reset_type = select_reset_type(action, &system.allowable_reset_types)
+            .ok_or(RedfishError::UnsupportedPowerAction(action))?;
+        let target = system
+            .reset_target
+            .ok_or(RedfishError::NoPowerResetAction)?;
+        self.send_json(
+            reqwest::Method::POST,
+            &target,
+            json!({ "ResetType": reset_type }),
+        )
+        .await?;
+        Ok(PowerCommandResult {
+            system_uri: system.uri,
+            requested_action: action,
+            reset_type: reset_type.to_owned(),
+        })
+    }
+
+    async fn power_system(&self) -> Result<PowerSystem, RedfishError> {
+        let root: ServiceRoot = self.get_json("/redfish/v1/").await?;
+        let systems = root.systems.ok_or(RedfishError::NoComputerSystem)?;
+        let systems: Collection = self.get_json(&systems.odata_id).await?;
+        let system = systems
+            .members
+            .into_iter()
+            .next()
+            .ok_or(RedfishError::NoComputerSystem)?;
+        let response: ComputerSystem = self.get_json(&system.odata_id).await?;
+        let reset = response.reset_action();
+        Ok(PowerSystem {
+            uri: system.odata_id,
+            power_state: response.power_state,
+            reset_target: reset.as_ref().map(|action| action.target.clone()),
+            allowable_reset_types: reset
+                .map(|action| action.allowable_reset_types)
+                .unwrap_or_default(),
         })
     }
 
@@ -745,6 +829,29 @@ fn static_ipv4_payload(network: &StaticNetwork) -> Value {
     })
 }
 
+fn supported_power_actions(allowable_reset_types: &[String]) -> Vec<PowerAction> {
+    [PowerAction::On, PowerAction::Shutdown, PowerAction::Restart]
+        .into_iter()
+        .filter(|action| select_reset_type(*action, allowable_reset_types).is_some())
+        .collect()
+}
+
+/// Prefer graceful operations where the firmware offers them, then use the B300-compatible
+/// forced variant as an explicit fallback. The actual selection is returned to the UI.
+fn select_reset_type(action: PowerAction, allowable_reset_types: &[String]) -> Option<&str> {
+    let preferred: &[&str] = match action {
+        PowerAction::On => &["On"],
+        PowerAction::Shutdown => &["GracefulShutdown", "ForceOff"],
+        PowerAction::Restart => &["GracefulRestart", "ForceRestart"],
+    };
+    preferred.iter().find_map(|candidate| {
+        allowable_reset_types
+            .iter()
+            .find(|allowed| allowed.eq_ignore_ascii_case(candidate))
+            .map(String::as_str)
+    })
+}
+
 fn dhcpv4_disable_payload() -> Value {
     json!({ "DHCPv4": { "DHCPEnabled": false } })
 }
@@ -874,6 +981,12 @@ pub enum RedfishError {
     NoManager,
     #[error("Redfish did not expose a Manager EthernetInterface resource")]
     NoEthernetInterfaces,
+    #[error("Redfish did not expose a ComputerSystem resource")]
+    NoComputerSystem,
+    #[error("Redfish ComputerSystem does not expose a reset action")]
+    NoPowerResetAction,
+    #[error("this BMC does not support the requested {0:?} power action")]
+    UnsupportedPowerAction(PowerAction),
     #[error(transparent)]
     InvalidNetwork(#[from] crate::model::NetworkValidationError),
 }
@@ -890,6 +1003,8 @@ struct ServiceRoot {
     account_service: Link,
     #[serde(rename = "Managers")]
     managers: Link,
+    #[serde(rename = "Systems", default)]
+    systems: Option<Link>,
 }
 
 #[derive(Deserialize)]
@@ -908,6 +1023,48 @@ struct Collection {
 struct Manager {
     #[serde(rename = "EthernetInterfaces")]
     ethernet_interfaces: Option<Link>,
+}
+
+struct PowerSystem {
+    uri: String,
+    power_state: Option<String>,
+    reset_target: Option<String>,
+    allowable_reset_types: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ComputerSystem {
+    #[serde(rename = "PowerState")]
+    power_state: Option<String>,
+    #[serde(rename = "Actions", default)]
+    actions: Value,
+}
+
+struct ResetAction {
+    target: String,
+    allowable_reset_types: Vec<String>,
+}
+
+impl ComputerSystem {
+    fn reset_action(&self) -> Option<ResetAction> {
+        let action = self.actions.get("#ComputerSystem.Reset")?;
+        let target = action.get("target")?.as_str()?.to_owned();
+        let allowable_reset_types = action
+            .get("ResetType@Redfish.AllowableValues")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(ResetAction {
+            target,
+            allowable_reset_types,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -1006,6 +1163,59 @@ mod tests {
                 Err(error) => error,
             };
         assert!(matches!(error, RedfishError::HttpsRequired));
+    }
+
+    #[tokio::test]
+    async fn uses_computer_system_reset_values_advertised_by_the_bmc() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "AccountService": { "@odata.id": "/redfish/v1/AccountService" },
+                "Managers": { "@odata.id": "/redfish/v1/Managers" },
+                "Systems": { "@odata.id": "/redfish/v1/Systems" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{ "@odata.id": "/redfish/v1/Systems/1" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "PowerState": "Off",
+                "Actions": {
+                    "#ComputerSystem.Reset": {
+                        "target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                        "ResetType@Redfish.AllowableValues": ["On", "ForceOff", "ForceRestart"]
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"))
+            .and(body_json(json!({ "ResetType": "ForceRestart" })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let status = client.power_status().await.unwrap();
+        assert_eq!(status.power_state.as_deref(), Some("Off"));
+        assert_eq!(
+            status.supported_actions,
+            vec![PowerAction::On, PowerAction::Shutdown, PowerAction::Restart]
+        );
+        let result = client.set_power(PowerAction::Restart).await.unwrap();
+        assert_eq!(result.reset_type, "ForceRestart");
+        server.verify().await;
     }
 
     async fn mock_discovery(server: &MockServer, password_change_required: bool, action: bool) {

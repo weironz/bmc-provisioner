@@ -16,8 +16,11 @@ use axum::{
 use bmc_provisioner::{
     lessor::LessorClient,
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
-    redfish::{CertificateFingerprint, EthernetInterface, RedfishClient, probe_certificate},
-    storage::{CredentialProfileMeta, InventoryStore, ManagedBmc, ProvisionDefaults},
+    redfish::{
+        CertificateFingerprint, EthernetInterface, PowerAction, PowerCommandResult, PowerStatus,
+        RedfishClient, probe_certificate,
+    },
+    storage::{BmcCluster, CredentialProfileMeta, InventoryStore, ManagedBmc, ProvisionDefaults},
     workflow::{ProvisionWorkflow, WorkflowProgress, select_interface},
 };
 use serde::{Deserialize, Serialize};
@@ -259,6 +262,7 @@ struct CreateManagedBmcRequest {
     current_ip: Ipv4Addr,
     mac: Option<String>,
     scope_name: Option<String>,
+    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +271,64 @@ struct UpdateManagedBmcRequest {
     current_ip: Option<Ipv4Addr>,
     credential_profile: Option<String>,
     allow_reprovision: Option<bool>,
+    display_name: Option<String>,
+    /// `null` explicitly removes the BMC from its cluster; an omitted property preserves it.
+    cluster_id: Option<Option<i64>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateClusterRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateClusterRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchClusterAssignmentRequest {
+    identities: Vec<String>,
+    cluster_id: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchClusterAssignmentResponse {
+    updated: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedPowerStatusRequest {
+    /// First-time self-signed certificates remain an explicit operator trust decision.
+    trust_certificate: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedPowerRequest {
+    action: PowerAction,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedPowerStatusResponse {
+    managed: ManagedBmc,
+    power: Option<PowerStatus>,
+    certificate_fingerprint: Option<CertificateFingerprint>,
+    certificate_trust_required: bool,
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedPowerCommandResponse {
+    managed: ManagedBmc,
+    command: PowerCommandResult,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -391,8 +453,25 @@ async fn main() {
             patch(update_managed_bmc).delete(delete_managed_bmc),
         )
         .route(
+            "/api/v1/managed-bmcs/batch/cluster",
+            post(assign_managed_bmcs_to_cluster),
+        )
+        .route("/api/v1/clusters", get(list_clusters).post(create_cluster))
+        .route(
+            "/api/v1/clusters/{cluster_id}",
+            patch(update_cluster).delete(delete_cluster),
+        )
+        .route(
             "/api/v1/managed-bmcs/{identity}/check",
             post(check_managed_bmc),
+        )
+        .route(
+            "/api/v1/managed-bmcs/{identity}/power/status",
+            post(managed_power_status),
+        )
+        .route(
+            "/api/v1/managed-bmcs/{identity}/power",
+            post(managed_power_command),
         )
         .route(
             "/api/v1/settings/defaults",
@@ -1057,6 +1136,75 @@ async fn list_managed_bmcs(
     })
 }
 
+async fn list_clusters(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<BmcCluster>>, ApiError> {
+    state
+        .inventory
+        .list_clusters()
+        .map(Json)
+        .map_err(inventory_api_error)
+}
+
+async fn create_cluster(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateClusterRequest>,
+) -> Result<(StatusCode, Json<BmcCluster>), ApiError> {
+    let name = valid_cluster_name(&request.name)?;
+    let cluster = state
+        .inventory
+        .create_cluster(&name)
+        .map_err(inventory_api_error)?;
+    Ok((StatusCode::CREATED, Json(cluster)))
+}
+
+async fn update_cluster(
+    State(state): State<Arc<AppState>>,
+    Path(cluster_id): Path<i64>,
+    Json(request): Json<UpdateClusterRequest>,
+) -> Result<Json<BmcCluster>, ApiError> {
+    let name = valid_cluster_name(&request.name)?;
+    state
+        .inventory
+        .update_cluster(cluster_id, &name)
+        .map(Json)
+        .map_err(inventory_api_error)
+}
+
+async fn assign_managed_bmcs_to_cluster(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchClusterAssignmentRequest>,
+) -> Result<Json<BatchClusterAssignmentResponse>, ApiError> {
+    let identities = request
+        .identities
+        .into_iter()
+        .map(|identity| identity.trim().to_ascii_lowercase())
+        .filter(|identity| !identity.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if identities.is_empty() {
+        return Err(ApiError::bad_request("select at least one BMC"));
+    }
+    let identities = identities.into_iter().collect::<Vec<_>>();
+    state
+        .inventory
+        .set_cluster_many(&identities, request.cluster_id)
+        .map_err(inventory_api_error)?;
+    Ok(Json(BatchClusterAssignmentResponse {
+        updated: identities.len(),
+    }))
+}
+
+async fn delete_cluster(
+    State(state): State<Arc<AppState>>,
+    Path(cluster_id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .inventory
+        .delete_cluster(cluster_id)
+        .map_err(inventory_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Adds an address to the local BMC inventory. This deliberately has no Redfish side effects.
 async fn create_managed_bmc(
     State(state): State<Arc<AppState>>,
@@ -1068,6 +1216,12 @@ async fn create_managed_bmc(
             request.current_ip,
             request.mac.as_deref(),
             request.scope_name.as_deref(),
+            request
+                .display_name
+                .as_deref()
+                .map(valid_display_name)
+                .transpose()?
+                .as_deref(),
         )
         .map_err(inventory_api_error)?;
     Ok((StatusCode::CREATED, Json(managed)))
@@ -1105,6 +1259,19 @@ async fn update_managed_bmc(
         managed = state
             .inventory
             .set_credential_profile(&identity, &profile)
+            .map_err(inventory_api_error)?;
+    }
+    if let Some(display_name) = request.display_name {
+        let display_name = valid_display_name(&display_name)?;
+        managed = state
+            .inventory
+            .update_display_name(&identity, &display_name)
+            .map_err(inventory_api_error)?;
+    }
+    if let Some(cluster_id) = request.cluster_id {
+        managed = state
+            .inventory
+            .set_cluster(&identity, cluster_id)
             .map_err(inventory_api_error)?;
     }
     if request.allow_reprovision.unwrap_or(false) {
@@ -1393,6 +1560,24 @@ fn valid_profile_name(name: &str) -> Result<String, ApiError> {
     Ok(name.to_owned())
 }
 
+fn valid_display_name(name: &str) -> Result<String, ApiError> {
+    let name = name.trim();
+    if name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "server name must be at most 128 printable characters",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn valid_cluster_name(name: &str) -> Result<String, ApiError> {
+    let name = valid_display_name(name)?;
+    if name.is_empty() {
+        return Err(ApiError::bad_request("cluster name is required"));
+    }
+    Ok(name)
+}
+
 fn profile_account(name: &str) -> String {
     format!("{CREDENTIAL_PROFILE_PREFIX}{name}")
 }
@@ -1464,6 +1649,224 @@ async fn check_managed_bmc(
         .record_health(&identity, health.0, health.1, health.2, health.3)
         .map(Json)
         .map_err(inventory_api_error)
+}
+
+/// Reads the standard ComputerSystem power resource exposed by B300's AMI Redfish service.
+/// A self-signed certificate is never accepted implicitly: the first result returns its
+/// fingerprint and requires the caller to repeat with `trustCertificate: true`.
+async fn managed_power_status(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+    Json(request): Json<ManagedPowerStatusRequest>,
+) -> Result<Json<ManagedPowerStatusResponse>, ApiError> {
+    let mut managed = state
+        .inventory
+        .find(&identity)
+        .map_err(inventory_api_error)?
+        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    let fingerprint = match probe_certificate(managed.current_ip).await {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            tracing::warn!(error = %error, ip = %managed.current_ip, "BMC HTTPS status probe failed");
+            let managed = state
+                .inventory
+                .record_health(
+                    &identity,
+                    "offline",
+                    "unreachable",
+                    "unknown",
+                    Some("HTTPS connection failed"),
+                )
+                .map_err(inventory_api_error)?;
+            return Ok(Json(ManagedPowerStatusResponse {
+                managed,
+                power: None,
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: Some("BMC HTTPS is unreachable".to_owned()),
+            }));
+        }
+    };
+
+    if managed.certificate_fingerprint.is_none() && !request.trust_certificate.unwrap_or(false) {
+        let managed = state
+            .inventory
+            .record_health(
+                &identity,
+                "online",
+                "reachable",
+                "unknown",
+                Some("BMC certificate needs explicit confirmation"),
+            )
+            .map_err(inventory_api_error)?;
+        return Ok(Json(ManagedPowerStatusResponse {
+            managed,
+            power: None,
+            certificate_fingerprint: Some(fingerprint),
+            certificate_trust_required: true,
+            detail: Some("confirm this BMC certificate before Redfish management".to_owned()),
+        }));
+    }
+    if managed.certificate_fingerprint.is_none() {
+        managed = state
+            .inventory
+            .set_certificate_fingerprint(&identity, &fingerprint.sha256)
+            .map_err(inventory_api_error)?;
+    }
+
+    let credentials = credentials_for_profile(state.as_ref(), &managed.credential_profile).await?;
+    let client = RedfishClient::for_ipv4_with_fingerprint(
+        managed.current_ip,
+        &credentials,
+        managed.certificate_fingerprint.as_deref(),
+    )
+    .map_err(workflow_redfish_api_error)?;
+    match client.power_status().await {
+        Ok(power) => {
+            let managed = state
+                .inventory
+                .record_health(&identity, "online", "reachable", "success", None)
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedPowerStatusResponse {
+                managed,
+                power: Some(power),
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: None,
+            }))
+        }
+        Err(bmc_provisioner::redfish::RedfishError::AuthenticationFailed) => {
+            let managed = state
+                .inventory
+                .record_health(
+                    &identity,
+                    "online",
+                    "reachable",
+                    "failed",
+                    Some("Redfish authentication failed"),
+                )
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedPowerStatusResponse {
+                managed,
+                power: None,
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: Some("Redfish credential authentication failed".to_owned()),
+            }))
+        }
+        Err(bmc_provisioner::redfish::RedfishError::NoComputerSystem)
+        | Err(bmc_provisioner::redfish::RedfishError::NoPowerResetAction) => {
+            let managed = state
+                .inventory
+                .record_health(&identity, "online", "reachable", "success", None)
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedPowerStatusResponse {
+                managed,
+                power: None,
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: Some(
+                    "Redfish is available but this BMC does not expose a standard power action"
+                        .to_owned(),
+                ),
+            }))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, ip = %managed.current_ip, "could not read Redfish power status");
+            let managed = state
+                .inventory
+                .record_health(
+                    &identity,
+                    "online",
+                    "unreachable",
+                    "unknown",
+                    Some("Redfish power status could not be read"),
+                )
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedPowerStatusResponse {
+                managed,
+                power: None,
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: Some("BMC Redfish did not return a usable power status".to_owned()),
+            }))
+        }
+    }
+}
+
+/// Executes only a capability-advertised standard ComputerSystem.Reset action. The controller's
+/// own allowable ResetType list selects the exact vendor-compatible spelling.
+async fn managed_power_command(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+    Json(request): Json<ManagedPowerRequest>,
+) -> Result<Json<ManagedPowerCommandResponse>, ApiError> {
+    let managed = state
+        .inventory
+        .find(&identity)
+        .map_err(inventory_api_error)?
+        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    let fingerprint = managed.certificate_fingerprint.as_deref().ok_or_else(|| {
+        ApiError::unprocessable(
+            "read BMC status and explicitly confirm its certificate before power control",
+        )
+    })?;
+    let credentials = credentials_for_profile(state.as_ref(), &managed.credential_profile).await?;
+    let client = RedfishClient::for_ipv4_with_fingerprint(
+        managed.current_ip,
+        &credentials,
+        Some(fingerprint),
+    )
+    .map_err(workflow_redfish_api_error)?;
+    match client.set_power(request.action).await {
+        Ok(command) => {
+            let managed = state
+                .inventory
+                .record_health(&identity, "online", "reachable", "success", None)
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedPowerCommandResponse { managed, command }))
+        }
+        Err(bmc_provisioner::redfish::RedfishError::AuthenticationFailed) => {
+            state
+                .inventory
+                .record_health(
+                    &identity,
+                    "online",
+                    "reachable",
+                    "failed",
+                    Some("Redfish authentication failed"),
+                )
+                .map_err(inventory_api_error)?;
+            Err(ApiError::unprocessable("BMC Redfish authentication failed"))
+        }
+        Err(bmc_provisioner::redfish::RedfishError::UnsupportedPowerAction(_))
+        | Err(bmc_provisioner::redfish::RedfishError::NoComputerSystem)
+        | Err(bmc_provisioner::redfish::RedfishError::NoPowerResetAction) => Err(
+            ApiError::unprocessable("selected power operation is not supported by this BMC"),
+        ),
+        Err(bmc_provisioner::redfish::RedfishError::Request(error)) => {
+            tracing::warn!(error = %error, ip = %managed.current_ip, "BMC power operation could not reach Redfish");
+            state
+                .inventory
+                .record_health(
+                    &identity,
+                    "offline",
+                    "unreachable",
+                    "unknown",
+                    Some("Redfish connection failed during power operation"),
+                )
+                .map_err(inventory_api_error)?;
+            Err(ApiError::unprocessable(
+                "could not reach BMC Redfish for the power operation",
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, ip = %managed.current_ip, "BMC rejected power operation");
+            Err(ApiError::unprocessable(
+                "BMC rejected the requested Redfish power operation",
+            ))
+        }
+    }
 }
 
 fn lessor_client(lessor_url: &str) -> Result<LessorClient, ApiError> {

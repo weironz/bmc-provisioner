@@ -18,6 +18,8 @@ use crate::model::{BmcCandidate, ProvisionResult, ProvisionStatus, StaticNetwork
 #[serde(rename_all = "camelCase")]
 pub struct ManagedBmc {
     pub identity: String,
+    pub display_name: String,
+    pub cluster_id: Option<i64>,
     pub mac: Option<String>,
     pub scope_id: u64,
     pub scope_name: String,
@@ -33,6 +35,16 @@ pub struct ManagedBmc {
     pub last_checked_at: Option<i64>,
     pub last_configured_at: Option<i64>,
     pub last_error: Option<String>,
+}
+
+/// An operator-defined group of servers. It is intentionally local metadata and never changes
+/// a BMC, lessor scope, or DHCP lease.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BmcCluster {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
 }
 
 /// Only a profile label and user name live in SQLite. Password material remains in the OS vault.
@@ -96,6 +108,8 @@ impl InventoryStore {
                 "
                 CREATE TABLE IF NOT EXISTS managed_bmcs (
                     identity TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    cluster_id INTEGER,
                     mac TEXT,
                     scope_id INTEGER NOT NULL,
                     scope_name TEXT NOT NULL,
@@ -114,6 +128,11 @@ impl InventoryStore {
                     last_configured_at INTEGER,
                     last_error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS bmc_clusters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS application_settings (
                     setting_key TEXT PRIMARY KEY,
                     setting_value TEXT NOT NULL
@@ -126,6 +145,8 @@ impl InventoryStore {
             "credential_profile",
             "TEXT NOT NULL DEFAULT 'default'",
         )?;
+        ensure_managed_bmc_column(&connection, "display_name", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_managed_bmc_column(&connection, "cluster_id", "INTEGER")?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -183,11 +204,136 @@ impl InventoryStore {
         self.save_setting("credential_profiles", profiles)
     }
 
+    pub fn list_clusters(&self) -> Result<Vec<BmcCluster>, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let mut statement = connection
+            .prepare("SELECT id, name, created_at FROM bmc_clusters ORDER BY name COLLATE NOCASE")
+            .map_err(StoreError::Database)?;
+        statement
+            .query_map([], row_to_cluster)
+            .map_err(StoreError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Database)
+    }
+
+    pub fn create_cluster(&self, name: &str) -> Result<BmcCluster, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        connection
+            .execute(
+                "INSERT INTO bmc_clusters (name, created_at) VALUES (?1, ?2)",
+                params![name, timestamp()],
+            )
+            .map_err(StoreError::Database)?;
+        let id = connection.last_insert_rowid();
+        drop(connection);
+        self.find_cluster(id)?.ok_or(StoreError::MissingRecord)
+    }
+
+    pub fn update_cluster(&self, id: i64, name: &str) -> Result<BmcCluster, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute(
+                "UPDATE bmc_clusters SET name=?2 WHERE id=?1",
+                params![id, name],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        self.find_cluster(id)?.ok_or(StoreError::MissingRecord)
+    }
+
+    /// Deleting a cluster preserves every BMC history row and only removes its grouping.
+    pub fn delete_cluster(&self, id: i64) -> Result<(), StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(StoreError::Database)?;
+        transaction
+            .execute(
+                "UPDATE managed_bmcs SET cluster_id=NULL WHERE cluster_id=?1",
+                [id],
+            )
+            .map_err(StoreError::Database)?;
+        let changed = transaction
+            .execute("DELETE FROM bmc_clusters WHERE id=?1", [id])
+            .map_err(StoreError::Database)?;
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        transaction.commit().map_err(StoreError::Database)
+    }
+
+    pub fn set_cluster(
+        &self,
+        identity: &str,
+        cluster_id: Option<i64>,
+    ) -> Result<ManagedBmc, StoreError> {
+        if let Some(cluster_id) = cluster_id
+            && self.find_cluster(cluster_id)?.is_none()
+        {
+            return Err(StoreError::MissingRecord);
+        }
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute(
+                "UPDATE managed_bmcs SET cluster_id=?2 WHERE identity=?1",
+                params![identity, cluster_id],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        self.find(identity)?.ok_or(StoreError::MissingRecord)
+    }
+
+    /// Applies a local cluster association to every requested BMC atomically.  No BMC request
+    /// is made; the transaction either updates the entire selection or none of it.
+    pub fn set_cluster_many(
+        &self,
+        identities: &[String],
+        cluster_id: i64,
+    ) -> Result<(), StoreError> {
+        if self.find_cluster(cluster_id)?.is_none() {
+            return Err(StoreError::MissingRecord);
+        }
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(StoreError::Database)?;
+        for identity in identities {
+            let changed = transaction
+                .execute(
+                    "UPDATE managed_bmcs SET cluster_id=?2 WHERE identity=?1",
+                    params![identity, cluster_id],
+                )
+                .map_err(StoreError::Database)?;
+            if changed == 0 {
+                return Err(StoreError::MissingRecord);
+            }
+        }
+        transaction.commit().map_err(StoreError::Database)
+    }
+
+    fn find_cluster(&self, id: i64) -> Result<Option<BmcCluster>, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        connection
+            .query_row(
+                "SELECT id, name, created_at FROM bmc_clusters WHERE id=?1",
+                [id],
+                row_to_cluster,
+            )
+            .optional()
+            .map_err(StoreError::Database)
+    }
+
     pub fn list(&self) -> Result<Vec<ManagedBmc>, StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
         let mut statement = connection
             .prepare(
-                "SELECT identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
+                "SELECT identity, display_name, cluster_id, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
                         target_prefix, target_gateway, certificate_fingerprint, configuration_status,
                         online_status, redfish_status, authentication_status, last_checked_at,
                         last_configured_at, last_error
@@ -205,7 +351,7 @@ impl InventoryStore {
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
         connection
             .query_row(
-                "SELECT identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
+                "SELECT identity, display_name, cluster_id, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
                         target_prefix, target_gateway, certificate_fingerprint, configuration_status,
                         online_status, redfish_status, authentication_status, last_checked_at,
                         last_configured_at, last_error
@@ -359,6 +505,28 @@ impl InventoryStore {
         self.find(identity)?.ok_or(StoreError::MissingRecord)
     }
 
+    /// Stores a certificate fingerprint only after an explicit operator trust decision.
+    /// It is used for subsequent authenticated Redfish requests; no private key or
+    /// credential material is retained in SQLite.
+    pub fn set_certificate_fingerprint(
+        &self,
+        identity: &str,
+        certificate_fingerprint: &str,
+    ) -> Result<ManagedBmc, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute(
+                "UPDATE managed_bmcs SET certificate_fingerprint=?2 WHERE identity=?1",
+                params![identity, certificate_fingerprint],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        self.find(identity)?.ok_or(StoreError::MissingRecord)
+    }
+
     /// Add a known BMC to the local inventory without contacting it or changing its network.
     /// This is useful for preserving an operator-maintained record that was not discovered by
     /// the local lessor instance.
@@ -367,6 +535,7 @@ impl InventoryStore {
         current_ip: Ipv4Addr,
         mac: Option<&str>,
         scope_name: Option<&str>,
+        display_name: Option<&str>,
     ) -> Result<ManagedBmc, StoreError> {
         let identity = mac
             .map(str::to_owned)
@@ -376,15 +545,15 @@ impl InventoryStore {
         connection
             .execute(
                 "INSERT INTO managed_bmcs (
-                    identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
+                    identity, display_name, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
                     target_prefix, target_gateway, certificate_fingerprint, configuration_status,
                     online_status, redfish_status, authentication_status, last_checked_at,
                     last_configured_at, last_error
-                ) VALUES (?1, ?2, 0, ?3, 'default', ?4, ?4, ?4, 24, '0.0.0.0', NULL, 'manual',
-                          'unknown', 'unknown', 'unknown', NULL, ?5, NULL)
+                ) VALUES (?1, ?2, ?3, 0, ?4, 'default', ?5, ?5, ?5, 24, '0.0.0.0', NULL, 'manual',
+                          'unknown', 'unknown', 'unknown', NULL, ?6, NULL)
                 ON CONFLICT(identity) DO UPDATE SET
-                    mac=excluded.mac, scope_name=excluded.scope_name, current_ip=excluded.current_ip",
-                params![identity, mac, scope_name.unwrap_or("手动添加"), current_ip.to_string(), now],
+                    display_name=excluded.display_name, mac=excluded.mac, scope_name=excluded.scope_name, current_ip=excluded.current_ip",
+                params![identity, display_name.unwrap_or(""), mac, scope_name.unwrap_or("手动添加"), current_ip.to_string(), now],
             )
             .map_err(StoreError::Database)?;
         drop(connection);
@@ -404,6 +573,26 @@ impl InventoryStore {
                  redfish_status='unknown', authentication_status='unknown', last_checked_at=NULL
                  WHERE identity=?1",
                 params![identity, current_ip.to_string()],
+            )
+            .map_err(StoreError::Database)?;
+        drop(connection);
+        if changed == 0 {
+            return Err(StoreError::MissingRecord);
+        }
+        self.find(identity)?.ok_or(StoreError::MissingRecord)
+    }
+
+    /// Changes the operator-facing server label only. It has no BMC-side effect.
+    pub fn update_display_name(
+        &self,
+        identity: &str,
+        display_name: &str,
+    ) -> Result<ManagedBmc, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let changed = connection
+            .execute(
+                "UPDATE managed_bmcs SET display_name=?2 WHERE identity=?1",
+                params![identity, display_name.trim()],
             )
             .map_err(StoreError::Database)?;
         drop(connection);
@@ -452,25 +641,35 @@ fn row_to_managed_bmc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedBmc> {
     };
     Ok(ManagedBmc {
         identity: row.get(0)?,
-        mac: row.get(1)?,
-        scope_id: row.get::<_, i64>(2)? as u64,
-        scope_name: row.get(3)?,
-        credential_profile: row.get(4)?,
-        source_ip: parse_ip(5)?,
-        current_ip: parse_ip(6)?,
+        display_name: row.get(1)?,
+        cluster_id: row.get(2)?,
+        mac: row.get(3)?,
+        scope_id: row.get::<_, i64>(4)? as u64,
+        scope_name: row.get(5)?,
+        credential_profile: row.get(6)?,
+        source_ip: parse_ip(7)?,
+        current_ip: parse_ip(8)?,
         target_network: StaticNetwork {
-            address: parse_ip(7)?,
-            prefix: row.get::<_, i64>(8)? as u8,
-            gateway: parse_ip(9)?,
+            address: parse_ip(9)?,
+            prefix: row.get::<_, i64>(10)? as u8,
+            gateway: parse_ip(11)?,
         },
-        certificate_fingerprint: row.get(10)?,
-        configuration_status: row.get(11)?,
-        online_status: row.get(12)?,
-        redfish_status: row.get(13)?,
-        authentication_status: row.get(14)?,
-        last_checked_at: row.get(15)?,
-        last_configured_at: row.get(16)?,
-        last_error: row.get(17)?,
+        certificate_fingerprint: row.get(12)?,
+        configuration_status: row.get(13)?,
+        online_status: row.get(14)?,
+        redfish_status: row.get(15)?,
+        authentication_status: row.get(16)?,
+        last_checked_at: row.get(17)?,
+        last_configured_at: row.get(18)?,
+        last_error: row.get(19)?,
+    })
+}
+
+fn row_to_cluster(row: &rusqlite::Row<'_>) -> rusqlite::Result<BmcCluster> {
+    Ok(BmcCluster {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
     })
 }
 
@@ -634,9 +833,11 @@ mod tests {
                 Ipv4Addr::new(172, 16, 40, 200),
                 Some("00:11:22:33:44:55"),
                 Some("机房 A"),
+                Some("rack-a-server-01"),
             )
             .unwrap();
         assert_eq!(created.configuration_status, "manual");
+        assert_eq!(created.display_name, "rack-a-server-01");
 
         let updated = store
             .update_address(&created.identity, Ipv4Addr::new(172, 16, 40, 201))
@@ -646,6 +847,58 @@ mod tests {
 
         store.delete(&created.identity).unwrap();
         assert!(store.list().unwrap().is_empty());
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn clusters_group_bmcs_and_deletion_only_unassigns_members() {
+        let path = std::env::temp_dir().join(format!("bmc-provisioner-{}.sqlite3", Uuid::new_v4()));
+        let store = InventoryStore::open(&path).unwrap();
+        let cluster = store.create_cluster("training-a").unwrap();
+        let managed = store
+            .add_manual(
+                Ipv4Addr::new(172, 16, 40, 18),
+                Some("00:11:22:33:44:66"),
+                Some("manual"),
+                Some("b300-01"),
+            )
+            .unwrap();
+
+        let assigned = store
+            .set_cluster(&managed.identity, Some(cluster.id))
+            .unwrap();
+        assert_eq!(assigned.cluster_id, Some(cluster.id));
+        assert_eq!(store.list_clusters().unwrap()[0].name, "training-a");
+
+        let second = store
+            .add_manual(
+                Ipv4Addr::new(172, 16, 40, 19),
+                Some("00:11:22:33:44:67"),
+                Some("manual"),
+                Some("b300-02"),
+            )
+            .unwrap();
+        store
+            .set_cluster_many(
+                &[managed.identity.clone(), second.identity.clone()],
+                cluster.id,
+            )
+            .unwrap();
+        assert!(
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .all(|item| item.cluster_id == Some(cluster.id))
+        );
+
+        store.delete_cluster(cluster.id).unwrap();
+        let retained = store.find(&managed.identity).unwrap().unwrap();
+        assert_eq!(retained.cluster_id, None);
+        let retained_second = store.find(&second.identity).unwrap().unwrap();
+        assert_eq!(retained_second.cluster_id, None);
+        assert!(store.list_clusters().unwrap().is_empty());
         drop(store);
         let _ = fs::remove_file(path);
     }

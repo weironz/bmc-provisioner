@@ -41,6 +41,22 @@ cargo run --bin bmc-provisionerd
 保存在本机 SQLite 清单中（Windows 默认位于 `%LOCALAPPDATA%\\bmc-provisioner\\inventory.sqlite3`）。
 每行可关联一个凭据档案；SQLite 只保存档案名，桌面端密码保存在系统凭据管理器。
 
+## BMC 管理（B300 初始支持）
+
+桌面端的“BMC 管理”页以本地 SQLite 清单为主，支持为服务器条目命名、手动增删改、
+批量刷新在线/Redfish/认证/电源状态，以及对勾选条目批量开机、关机和重启。首次使用
+自签名 HTTPS 证书时，必须在页面确认显示的 SHA-256 指纹，程序才会保存该指纹并发送
+认证请求。
+
+电源操作不会假定某个厂商路径或 ResetType：程序读取 `ComputerSystem.Reset` 的目标与
+`ResetType@Redfish.AllowableValues` 后才启用相应按钮。当前在 B300 的 AMI MegaRAC
+Redfish 实现上验证；其他机型只有在声明兼容标准资源和动作时才会被允许执行。
+
+“集群”页仅保存集群名称，用于组织任意大小的 BMC 分组。每台 BMC 通过本地
+`clusterId` 归属到一个集群；可在 BMC 管理页勾选多台后批量加入集群。lessor 的动态
+发现只更新候选地址，不会覆盖这项归属。删除集群会将其成员改为未分配，保留全部 BMC
+条目与操作历史。
+
 另开一个终端可启动开发界面：
 
 ```powershell
