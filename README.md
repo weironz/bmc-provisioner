@@ -39,7 +39,8 @@ cargo run --bin bmc-provisionerd
 
 每次配置完成或失败后，BMC 的 MAC、源/目标地址、证书指纹、配置结果和最后检查状态会
 保存在本机 SQLite 清单中（Windows 默认位于 `%LOCALAPPDATA%\\bmc-provisioner\\inventory.sqlite3`）。
-每行可关联一个凭据档案；SQLite 只保存档案名，桌面端密码保存在系统凭据管理器。
+日常 BMC 管理使用每台设备自己的用户名和加密密码密文；数据库主密钥不在 SQLite 中：
+Windows 桌面端保存在系统凭据管理器，容器部署从 Docker Secret 或挂载密钥文件读取。
 
 ## BMC 管理（B300 初始支持）
 
@@ -92,9 +93,9 @@ docker compose up -d
 1. 通过 `http://<服务器地址>:8080` 打开 lessor，选择网卡并创建 DHCP 作用域；
 2. 通过 `http://<服务器地址>:6770` 打开 bmc-provisioner；lessor 地址保持默认
    `http://127.0.0.1:8080`；
-3. 在“凭据档案”创建 BMC 凭据，再在清单每行选择对应档案。Compose 默认使用
-   `BMC_PROVISIONER_SESSION_CREDENTIALS=1`：由于容器通常没有系统密钥链，密码只
-   保存到服务内存，容器重启后须重新输入，且绝不会写入 SQLite。
+3. 先创建 Compose 所需的主密钥文件：`mkdir -p secrets && openssl rand -base64 48 >
+   secrets/bmc-provisioner-master-key && chmod 600 secrets/bmc-provisioner-master-key`。随后在
+   “设备清单”的每台 BMC 编辑页保存用户名和密码；密码会以密文持久化，容器重启后仍可使用。
 
 这套 Compose 使用命名卷持久化 lessor 配置/租约和 bmc-provisioner 清单。不要将
 `docker compose down -v` 用于生产环境，它会删除这些卷。

@@ -23,7 +23,16 @@ docker compose up -d
 docker compose ps
 ```
 
-默认会创建两个命名卷，分别保存 lessor 配置/租约和 BMC 配置清单。
+在首次 `up` 前还必须创建独立于数据库卷的主密钥文件：
+
+```sh
+mkdir -p secrets
+openssl rand -base64 48 > secrets/bmc-provisioner-master-key
+chmod 600 secrets/bmc-provisioner-master-key
+```
+
+默认会创建两个命名卷，分别保存 lessor 配置/租约和 BMC 配置清单。主密钥文件由
+Compose 作为 Docker Secret 挂载，不会进入镜像、Git 或 SQLite 数据库。
 
 ## 访问界面
 
@@ -54,10 +63,12 @@ ufw allow from <BMC 或 Relay 网段 CIDR> to any port 67 proto udp
 
 1. 打开 lessor，选择正确网卡并新建 DHCP 作用域；Relay 模式则创建对应 Relay 网段的作用域。
 2. 打开 bmc-provisioner。默认 lessor 地址保持 `http://127.0.0.1:8080`，因为两个容器使用 host 网络。
-3. 在“凭据档案”创建 BMC 凭据，并为每行 BMC 选择对应档案、填写目标静态 IPv4。
+3. 在“设备清单”编辑每台 BMC，保存它自己的用户名和密码，再填写目标静态 IPv4。
 4. 勾选已配对的 BMC 后执行配置；任务完成后在同一清单检查 Redfish 与认证状态。
 
-Docker 默认启用 `BMC_PROVISIONER_SESSION_CREDENTIALS=1`。容器没有系统凭据管理器，因此密码只保存在容器内存中，重启后需要重新录入；SQLite 清单不会保存密码。
+密码以 AES-256-GCM 密文保存在持久化 SQLite 卷中；解密所需主密钥只从
+`/run/secrets/bmc-provisioner-master-key` 读取。因此容器重启后凭据仍可用，但若遗失或替换
+该主密钥，旧密文将无法解密。请将该密钥与数据库备份一并按受控流程保存，且不要提交到 Git。
 
 ## 日常运维
 

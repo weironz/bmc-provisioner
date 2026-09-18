@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GPU 面板开发测试样例</title></head>
+<body><main id="fixture" style="padding:24px;max-width:1180px;margin:auto"></main><script type="module">
+import { mount } from 'svelte';
+import GpuPanel from '../src/lib/GpuPanel.svelte';
+import HardwarePanel from '../src/lib/HardwarePanel.svelte';
+import '../src/style.css';
+const target = document.getElementById('fixture');
+const title = document.createElement('h1');
+title.textContent = '开发测试样例 · 非实机数据';
+target.appendChild(title);
+mount(GpuPanel, {target, props:{data:{discovery:'available',availableCount:7,memoryCapacityMib:73728,warnings:[],cards:[
+  {id:'GPU_0',model:'测试 GPU · 完整指标',state:'Enabled',health:'OK',memoryCapacityMib:8192,memoryUtilizationPercent:0,memoryBandwidthPercent:23,utilizationPercent:0,temperatureCelsius:42,powerWatts:182.6,powerLimitWatts:350,correctableEccErrors:0,uncorrectableEccErrors:0,warnings:[]},
+  {id:'GPU_1',model:'测试 GPU · 缺失指标',state:'Disabled',health:'Warning',memoryCapacityMib:16384,warnings:['GPU 利用率：无读取权限']},
+  ...Array.from({length:6},(_,i)=>({id:'GPU_'+(i+2),model:'测试 GPU · 多卡布局',state:'Enabled',health:'OK',memoryCapacityMib:8192,memoryUtilizationPercent:40,utilizationPercent:60,temperatureCelsius:45,powerWatts:210,uncorrectableEccErrors:i===0?9:0,warnings:[]}))
+]}}});
+mount(HardwarePanel,{target,props:{data:{fans:[{name:'风扇 1',reading:6000,units:'RPM',state:'Enabled',health:'OK'}],powerSupplies:[],drives:[{name:'NVMe 1',health:'OK',capacityBytes:1e12,lifeLeftPercent:99,failurePredicted:false}],networkPorts:[]}}});
+const absent = document.createElement('div');
+target.appendChild(absent);
+mount(GpuPanel,{target:absent,props:{data:{discovery:'absent',cards:[],warnings:[]}}});
+if (absent.textContent.trim()) throw new Error('CPU-only fixture unexpectedly rendered a GPU panel');
+</script></body></html>

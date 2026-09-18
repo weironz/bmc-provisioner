@@ -40,9 +40,26 @@ fn sidecar_path() -> Option<PathBuf> {
         "bmc-provisionerd"
     };
     let executable_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let mut paths = vec![executable_dir.join(filename)];
-    for relative in ["../../../../target/release", "../../../../target/debug"] {
+    // In `tauri dev`, Cargo places a copied sidecar next to the desktop executable.
+    // That copy is not rebuilt when only the root service crate changes, so prefer the
+    // root target first to make the desktop use the current local service build.  A
+    // packaged release has no root target fallback and therefore continues to use its
+    // bundled sibling sidecar.
+    let bundled_sidecar = executable_dir.join(filename);
+    let mut paths = Vec::new();
+    if !cfg!(debug_assertions) {
+        paths.push(bundled_sidecar.clone());
+    }
+    let development_targets: &[&str] = if cfg!(debug_assertions) {
+        &["../../../../target/debug", "../../../../target/release"]
+    } else {
+        &["../../../../target/release", "../../../../target/debug"]
+    };
+    for relative in development_targets {
         paths.push(executable_dir.join(relative).join(filename));
+    }
+    if cfg!(debug_assertions) {
+        paths.push(bundled_sidecar);
     }
     paths.into_iter().find(|path| path.exists())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "bmc-provisioner"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 description = "Provision a single DHCP-addressed BMC through lessor and Redfish"
 license = "Apache-2.0"
@@ -14,6 +14,7 @@ name = "bmc-provisionerd"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1.0"
 axum = "0.8"
 keyring = "4.2"

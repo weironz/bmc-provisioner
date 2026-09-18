@@ -18,12 +18,16 @@ use bmc_provisioner::{
     model::{BmcCandidate, Credentials, ProvisionPlan, ProvisionResult, StaticNetwork},
     redfish::{
         CertificateFingerprint, EthernetInterface, PowerAction, PowerCommandResult, PowerStatus,
-        RedfishClient, probe_certificate,
+        RedfishClient, TelemetrySnapshot, probe_certificate,
     },
-    storage::{BmcCluster, CredentialProfileMeta, InventoryStore, ManagedBmc, ProvisionDefaults},
+    storage::{
+        BmcCluster, CredentialProfileMeta, DeviceCredentialKey, InventoryStore, ManagedBmc,
+        ProvisionDefaults, TelemetryHistoryPoint, TelemetryHistoryResolution,
+    },
     workflow::{ProvisionWorkflow, WorkflowProgress, select_interface},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tower_http::{
     cors::CorsLayer,
@@ -38,6 +42,7 @@ struct AppState {
     jobs: Mutex<HashMap<Uuid, JobRecord>>,
     provisioning_queue: Arc<ProvisioningQueue>,
     inventory: InventoryStore,
+    device_credential_key: DeviceCredentialKey,
     /// Docker often has neither Windows Credential Manager nor Linux Secret
     /// Service.  When explicitly enabled, profile secrets stay in this process
     /// only; SQLite still records only name and username.
@@ -263,6 +268,15 @@ struct CreateManagedBmcRequest {
     mac: Option<String>,
     scope_name: Option<String>,
     display_name: Option<String>,
+    credential_username: Option<String>,
+    credential_password: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedDeviceCredentialRequest {
+    username: String,
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -272,6 +286,7 @@ struct UpdateManagedBmcRequest {
     credential_profile: Option<String>,
     allow_reprovision: Option<bool>,
     display_name: Option<String>,
+    device_credentials: Option<ManagedDeviceCredentialRequest>,
     /// `null` explicitly removes the BMC from its cluster; an omitted property preserves it.
     cluster_id: Option<Option<i64>>,
 }
@@ -302,11 +317,7 @@ struct BatchClusterAssignmentResponse {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ManagedPowerStatusRequest {
-    /// First-time self-signed certificates remain an explicit operator trust decision.
-    trust_certificate: Option<bool>,
-}
+struct ManagedPowerStatusRequest {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -322,6 +333,34 @@ struct ManagedPowerStatusResponse {
     certificate_fingerprint: Option<CertificateFingerprint>,
     certificate_trust_required: bool,
     detail: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManagedTelemetryRequest {}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedTelemetryResponse {
+    managed: ManagedBmc,
+    telemetry: Option<TelemetrySnapshot>,
+    certificate_fingerprint: Option<CertificateFingerprint>,
+    certificate_trust_required: bool,
+    detail: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedTelemetryHistoryQuery {
+    range_seconds: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedTelemetryHistoryResponse {
+    points: Vec<TelemetryHistoryPoint>,
+    start_at: i64,
+    end_at: i64,
+    bucket_seconds: i64,
 }
 
 #[derive(Serialize)]
@@ -365,6 +404,7 @@ struct DefaultsResponse {
 const CREDENTIAL_SERVICE: &str = "io.bmc-provisioner.desktop";
 const CREDENTIAL_ACCOUNT: &str = "provision-defaults";
 const CREDENTIAL_PROFILE_PREFIX: &str = "profile:";
+const DEVICE_CREDENTIAL_MASTER_KEY_ACCOUNT: &str = "device-credential-master-key";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -409,6 +449,8 @@ async fn main() {
         .init();
 
     let inventory = InventoryStore::open_default().expect("open local BMC inventory");
+    let device_credential_key =
+        load_device_credential_key().expect("load BMC device credential master key");
     let defaults = inventory
         .load_defaults()
         .expect("load local provisioning defaults");
@@ -417,10 +459,12 @@ async fn main() {
         jobs: Mutex::new(HashMap::new()),
         provisioning_queue: Arc::new(ProvisioningQueue::new(defaults.batch_concurrency)),
         inventory,
+        device_credential_key,
         session_credentials: std::env::var("BMC_PROVISIONER_SESSION_CREDENTIALS")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")),
         session_profile_secrets: Mutex::new(HashMap::new()),
     });
+    migrate_legacy_managed_credentials(&state).await;
     let ui_directory =
         std::env::var("BMC_PROVISIONER_UI_DIR").unwrap_or_else(|_| "ui/dist".to_owned());
     let index = format!("{ui_directory}/index.html");
@@ -449,6 +493,10 @@ async fn main() {
             get(list_managed_bmcs).post(create_managed_bmc),
         )
         .route(
+            "/api/v1/managed-bmcs/{identity}/duplicate",
+            post(duplicate_managed_bmc),
+        )
+        .route(
             "/api/v1/managed-bmcs/{identity}",
             patch(update_managed_bmc).delete(delete_managed_bmc),
         )
@@ -468,6 +516,14 @@ async fn main() {
         .route(
             "/api/v1/managed-bmcs/{identity}/power/status",
             post(managed_power_status),
+        )
+        .route(
+            "/api/v1/managed-bmcs/{identity}/telemetry",
+            post(managed_telemetry),
+        )
+        .route(
+            "/api/v1/managed-bmcs/{identity}/telemetry/history",
+            get(managed_telemetry_history),
         )
         .route(
             "/api/v1/managed-bmcs/{identity}/power",
@@ -637,6 +693,15 @@ async fn inspect_candidate_network(
             &network,
             Some(&fingerprint.sha256),
             &credential_profile,
+        )
+        .map_err(inventory_api_error)?;
+    let managed = state
+        .inventory
+        .save_device_credential(
+            &managed.identity,
+            &credentials.username,
+            &credentials.current_password,
+            &state.device_credential_key,
         )
         .map_err(inventory_api_error)?;
     Ok(Json(CandidateNetworkInspectionResponse {
@@ -868,7 +933,34 @@ async fn run_job(
             ) {
                 tracing::error!(error = %error, job_id = %job_id, "could not persist configured BMC inventory");
             } else {
-                append_job_log(&state, job_id, "已保存本地 BMC 清单与访问状态").await;
+                let password = if result.password_transitioned {
+                    &credentials_for_rotation.new_password
+                } else {
+                    &credentials_for_rotation.current_password
+                };
+                if let Err(error) = state.inventory.save_device_credential(
+                    &managed_identity_for_candidate(&candidate),
+                    &credentials_for_rotation.username,
+                    password,
+                    &state.device_credential_key,
+                ) {
+                    // The Redfish result is still truthful; do not turn a completed BMC action
+                    // into a false failure if persisting its local encrypted secret fails.
+                    tracing::warn!(error = %error, job_id = %job_id, "could not persist encrypted BMC device credential");
+                    append_job_log(
+                        &state,
+                        job_id,
+                        "已保存本地 BMC 清单；设备登录凭据未能加密保存",
+                    )
+                    .await;
+                } else {
+                    append_job_log(
+                        &state,
+                        job_id,
+                        "已保存本地 BMC 清单、访问状态和加密登录凭据",
+                    )
+                    .await;
+                }
             }
             append_job_log(&state, job_id, "配置完成").await;
             update_job(&state, job_id, JobState::Completed, Some(result), None).await;
@@ -891,6 +983,13 @@ async fn run_job(
             update_job(&state, job_id, JobState::Failed, None, Some(safe_error)).await;
         }
     }
+}
+
+fn managed_identity_for_candidate(candidate: &BmcCandidate) -> String {
+    candidate
+        .mac
+        .clone()
+        .unwrap_or_else(|| format!("scope-{}-ip-{}", candidate.scope_id, candidate.ip))
 }
 
 /// Keep a factory-credential profile reusable for other uninitialized BMCs. Once one BMC has
@@ -1210,7 +1309,11 @@ async fn create_managed_bmc(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateManagedBmcRequest>,
 ) -> Result<(StatusCode, Json<ManagedBmc>), ApiError> {
-    let managed = state
+    let device_credentials = device_credential_from_parts(
+        request.credential_username.as_deref(),
+        request.credential_password.as_deref(),
+    )?;
+    let mut managed = state
         .inventory
         .add_manual(
             request.current_ip,
@@ -1224,6 +1327,30 @@ async fn create_managed_bmc(
                 .as_deref(),
         )
         .map_err(inventory_api_error)?;
+    if let Some((username, password)) = device_credentials {
+        managed = state
+            .inventory
+            .save_device_credential(
+                &managed.identity,
+                &username,
+                &password,
+                &state.device_credential_key,
+            )
+            .map_err(inventory_api_error)?;
+    }
+    Ok((StatusCode::CREATED, Json(managed)))
+}
+
+/// Copies local fleet metadata into a visible draft record. The BMC address is retained as an
+/// editable starting value, while the physical MAC is blanked; Redfish stays inactive until save.
+async fn duplicate_managed_bmc(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+) -> Result<(StatusCode, Json<ManagedBmc>), ApiError> {
+    let managed = state
+        .inventory
+        .duplicate(&identity)
+        .map_err(inventory_api_error)?;
     Ok((StatusCode::CREATED, Json(managed)))
 }
 
@@ -1234,6 +1361,9 @@ async fn update_managed_bmc(
     Path(identity): Path<String>,
     Json(request): Json<UpdateManagedBmcRequest>,
 ) -> Result<Json<ManagedBmc>, ApiError> {
+    if let Some(credentials) = request.device_credentials.as_ref() {
+        validate_device_credential(&credentials.username, &credentials.password)?;
+    }
     let mut managed = state
         .inventory
         .find(&identity)
@@ -1272,6 +1402,17 @@ async fn update_managed_bmc(
         managed = state
             .inventory
             .set_cluster(&identity, cluster_id)
+            .map_err(inventory_api_error)?;
+    }
+    if let Some(credentials) = request.device_credentials {
+        managed = state
+            .inventory
+            .save_device_credential(
+                &identity,
+                &credentials.username,
+                &credentials.password,
+                &state.device_credential_key,
+            )
             .map_err(inventory_api_error)?;
     }
     if request.allow_reprovision.unwrap_or(false) {
@@ -1515,6 +1656,70 @@ async fn credentials_for_profile(state: &AppState, name: &str) -> Result<Credent
     })
 }
 
+/// Device credentials are the normal BMC Fleet path. The legacy profile fallback is intentionally
+/// temporary so existing inventories keep working until operators replace each row's credentials.
+async fn credentials_for_managed_bmc(
+    state: &AppState,
+    managed: &ManagedBmc,
+) -> Result<Credentials, ApiError> {
+    if let Some(secret) = state
+        .inventory
+        .device_credential(&managed.identity, &state.device_credential_key)
+        .map_err(inventory_api_error)?
+    {
+        return Ok(Credentials {
+            username: secret.username,
+            current_password: secret.password,
+            new_password: String::new(),
+        });
+    }
+    if !managed.credential_profile.trim().is_empty() {
+        return credentials_for_profile(state, &managed.credential_profile).await;
+    }
+    Err(ApiError::not_found(
+        "BMC device credentials are not configured; edit this BMC and save its username and password",
+    ))
+}
+
+/// One-way best-effort migration for inventories created before device-level credentials. A
+/// readable legacy profile is copied into the encrypted per-BMC table, then detached from the
+/// row. Missing or session-only profiles stay untouched and are shown as pending migration in
+/// the UI; startup must never fail merely because an old profile is unavailable.
+async fn migrate_legacy_managed_credentials(state: &AppState) {
+    let managed = match state.inventory.list() {
+        Ok(managed) => managed,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not read BMC inventory for credential migration");
+            return;
+        }
+    };
+    let mut migrated = 0_usize;
+    for bmc in managed.into_iter().filter(|bmc| {
+        bmc.credential_username.is_none() && !bmc.credential_profile.trim().is_empty()
+    }) {
+        let Ok(credentials) = credentials_for_profile(state, &bmc.credential_profile).await else {
+            continue;
+        };
+        match state.inventory.save_device_credential(
+            &bmc.identity,
+            &credentials.username,
+            &credentials.current_password,
+            &state.device_credential_key,
+        ) {
+            Ok(_) => migrated += 1,
+            Err(error) => {
+                tracing::warn!(error = %error, identity = %bmc.identity, "could not migrate BMC credential")
+            }
+        }
+    }
+    if migrated > 0 {
+        tracing::info!(
+            migrated,
+            "migrated legacy BMC profiles into encrypted device credentials"
+        );
+    }
+}
+
 async fn save_profile_secret(
     state: &AppState,
     name: &str,
@@ -1570,6 +1775,37 @@ fn valid_display_name(name: &str) -> Result<String, ApiError> {
     Ok(name.to_owned())
 }
 
+fn validate_device_credential(username: &str, password: &str) -> Result<(), ApiError> {
+    let username = username.trim();
+    if username.is_empty() || username.len() > 128 || username.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "BMC username must be 1-128 printable characters",
+        ));
+    }
+    if password.is_empty() || password.len() > 1024 {
+        return Err(ApiError::bad_request(
+            "BMC password must be between 1 and 1024 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn device_credential_from_parts(
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<Option<(String, String)>, ApiError> {
+    match (username, password) {
+        (None, None) => Ok(None),
+        (Some(username), Some(password)) => {
+            validate_device_credential(username, password)?;
+            Ok(Some((username.trim().to_owned(), password.to_owned())))
+        }
+        _ => Err(ApiError::bad_request(
+            "provide both BMC credentialUsername and credentialPassword",
+        )),
+    }
+}
+
 fn valid_cluster_name(name: &str) -> Result<String, ApiError> {
     let name = valid_display_name(name)?;
     if name.is_empty() {
@@ -1580,6 +1816,62 @@ fn valid_cluster_name(name: &str) -> Result<String, ApiError> {
 
 fn profile_account(name: &str) -> String {
     format!("{CREDENTIAL_PROFILE_PREFIX}{name}")
+}
+
+/// Returns the application key used to encrypt per-BMC credentials in SQLite. The key never
+/// lives in SQLite: desktop installations create it once in Windows Credential Manager, while a
+/// headless deployment must receive it from a Docker/Kubernetes secret through an environment
+/// variable or mounted file.
+fn load_device_credential_key() -> Result<DeviceCredentialKey, String> {
+    if let Ok(path) = std::env::var("BMC_PROVISIONER_MASTER_KEY_FILE") {
+        let material = std::fs::read_to_string(&path)
+            .map_err(|error| format!("could not read BMC_PROVISIONER_MASTER_KEY_FILE: {error}"))?;
+        return device_credential_key_from_material(&material);
+    }
+    if let Ok(material) = std::env::var("BMC_PROVISIONER_MASTER_KEY") {
+        return device_credential_key_from_material(&material);
+    }
+    load_local_device_credential_key()
+}
+
+fn device_credential_key_from_material(material: &str) -> Result<DeviceCredentialKey, String> {
+    let material = material.trim();
+    if material.len() < 32 {
+        return Err("BMC credential master key must contain at least 32 characters".to_owned());
+    }
+    Ok(DeviceCredentialKey::new(
+        Sha256::digest(material.as_bytes()).into(),
+    ))
+}
+
+#[cfg(windows)]
+fn load_local_device_credential_key() -> Result<DeviceCredentialKey, String> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_MASTER_KEY_ACCOUNT)
+        .map_err(|error| format!("could not open Windows Credential Manager: {error}"))?;
+    let material = match entry.get_password() {
+        Ok(material) => material,
+        Err(keyring::Error::NoEntry) => {
+            let material = format!("{}{}", Uuid::new_v4(), Uuid::new_v4());
+            entry.set_password(&material).map_err(|error| {
+                format!("could not create Windows credential master key: {error}")
+            })?;
+            material
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not read Windows credential master key: {error}"
+            ));
+        }
+    };
+    device_credential_key_from_material(&material)
+}
+
+#[cfg(not(windows))]
+fn load_local_device_credential_key() -> Result<DeviceCredentialKey, String> {
+    Err(
+        "BMC_PROVISIONER_MASTER_KEY_FILE or BMC_PROVISIONER_MASTER_KEY is required outside Windows"
+            .to_owned(),
+    )
 }
 
 /// Checks a persisted BMC without retaining the supplied credential. A TLS handshake establishes
@@ -1614,11 +1906,11 @@ async fn check_managed_bmc(
             new_password: String::new(),
         },
         (None, None) => {
-            let profile = request
-                .credential_profile
-                .as_deref()
-                .unwrap_or(&managed.credential_profile);
-            credentials_for_profile(state.as_ref(), profile).await?
+            if let Some(profile) = request.credential_profile.as_deref() {
+                credentials_for_profile(state.as_ref(), profile).await?
+            } else {
+                credentials_for_managed_bmc(state.as_ref(), &managed).await?
+            }
         }
         _ => {
             return Err(ApiError::bad_request(
@@ -1652,12 +1944,12 @@ async fn check_managed_bmc(
 }
 
 /// Reads the standard ComputerSystem power resource exposed by B300's AMI Redfish service.
-/// A self-signed certificate is never accepted implicitly: the first result returns its
-/// fingerprint and requires the caller to repeat with `trustCertificate: true`.
+/// On first contact, the local controller pins the BMC's certificate fingerprint before
+/// continuing, so certificate handling never interrupts routine management.
 async fn managed_power_status(
     State(state): State<Arc<AppState>>,
     Path(identity): Path<String>,
-    Json(request): Json<ManagedPowerStatusRequest>,
+    Json(_request): Json<ManagedPowerStatusRequest>,
 ) -> Result<Json<ManagedPowerStatusResponse>, ApiError> {
     let mut managed = state
         .inventory
@@ -1688,25 +1980,6 @@ async fn managed_power_status(
         }
     };
 
-    if managed.certificate_fingerprint.is_none() && !request.trust_certificate.unwrap_or(false) {
-        let managed = state
-            .inventory
-            .record_health(
-                &identity,
-                "online",
-                "reachable",
-                "unknown",
-                Some("BMC certificate needs explicit confirmation"),
-            )
-            .map_err(inventory_api_error)?;
-        return Ok(Json(ManagedPowerStatusResponse {
-            managed,
-            power: None,
-            certificate_fingerprint: Some(fingerprint),
-            certificate_trust_required: true,
-            detail: Some("confirm this BMC certificate before Redfish management".to_owned()),
-        }));
-    }
     if managed.certificate_fingerprint.is_none() {
         managed = state
             .inventory
@@ -1714,7 +1987,7 @@ async fn managed_power_status(
             .map_err(inventory_api_error)?;
     }
 
-    let credentials = credentials_for_profile(state.as_ref(), &managed.credential_profile).await?;
+    let credentials = credentials_for_managed_bmc(state.as_ref(), &managed).await?;
     let client = RedfishClient::for_ipv4_with_fingerprint(
         managed.current_ip,
         &credentials,
@@ -1727,12 +2000,19 @@ async fn managed_power_status(
                 .inventory
                 .record_health(&identity, "online", "reachable", "success", None)
                 .map_err(inventory_api_error)?;
+            // Redfish authenticated and returned a ComputerSystem, yet advertised no ResetType
+            // this tool is willing to send. Say so, otherwise the disabled power buttons are
+            // indistinguishable from a BMC that was never probed.
+            let detail = power.supported_actions.is_empty().then(|| {
+                "Redfish is reachable but this BMC advertised no usable ResetType; power buttons stay disabled"
+                    .to_owned()
+            });
             Ok(Json(ManagedPowerStatusResponse {
                 managed,
                 power: Some(power),
                 certificate_fingerprint: None,
                 certificate_trust_required: false,
-                detail: None,
+                detail,
             }))
         }
         Err(bmc_provisioner::redfish::RedfishError::AuthenticationFailed) => {
@@ -1794,6 +2074,182 @@ async fn managed_power_status(
     }
 }
 
+fn current_timestamp_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn telemetry_history_window(
+    range_seconds: Option<i64>,
+) -> Result<(i64, i64, TelemetryHistoryResolution), ApiError> {
+    let range_seconds = range_seconds.unwrap_or(24 * 60 * 60);
+    let (bucket_seconds, resolution) = match range_seconds {
+        3_600 => (5, TelemetryHistoryResolution::Raw),
+        21_600 => (30, TelemetryHistoryResolution::Raw),
+        86_400 => (2 * 60, TelemetryHistoryResolution::Raw),
+        604_800 => (15 * 60, TelemetryHistoryResolution::Raw),
+        2_592_000 => (15 * 60, TelemetryHistoryResolution::FiveMinutes),
+        7_776_000 => (60 * 60, TelemetryHistoryResolution::FiveMinutes),
+        31_536_000 => (6 * 60 * 60, TelemetryHistoryResolution::OneHour),
+        _ => return Err(ApiError::bad_request("unsupported telemetry history range")),
+    };
+    Ok((range_seconds, bucket_seconds, resolution))
+}
+
+async fn managed_telemetry_history(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+    Query(query): Query<ManagedTelemetryHistoryQuery>,
+) -> Result<Json<ManagedTelemetryHistoryResponse>, ApiError> {
+    state
+        .inventory
+        .find(&identity)
+        .map_err(inventory_api_error)?
+        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    let (range_seconds, bucket_seconds, resolution) =
+        telemetry_history_window(query.range_seconds)?;
+    let end_at = current_timestamp_seconds();
+    let start_at = end_at - range_seconds;
+    let points = state
+        .inventory
+        .telemetry_history(&identity, start_at, bucket_seconds, resolution)
+        .map_err(inventory_api_error)?;
+    Ok(Json(ManagedTelemetryHistoryResponse {
+        points,
+        start_at,
+        end_at,
+        bucket_seconds,
+    }))
+}
+
+/// Collects a compact hardware summary for one managed BMC. The local controller pins a
+/// self-signed certificate on first contact and continues collection automatically.
+async fn managed_telemetry(
+    State(state): State<Arc<AppState>>,
+    Path(identity): Path<String>,
+    Json(_request): Json<ManagedTelemetryRequest>,
+) -> Result<Json<ManagedTelemetryResponse>, ApiError> {
+    let mut managed = state
+        .inventory
+        .find(&identity)
+        .map_err(inventory_api_error)?
+        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    let fingerprint = match probe_certificate(managed.current_ip).await {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            tracing::warn!(error = %error, ip = %managed.current_ip, "BMC telemetry HTTPS probe failed");
+            let managed = state
+                .inventory
+                .record_health(
+                    &identity,
+                    "offline",
+                    "unreachable",
+                    "unknown",
+                    Some("HTTPS connection failed during telemetry collection"),
+                )
+                .map_err(inventory_api_error)?;
+            return Ok(Json(ManagedTelemetryResponse {
+                managed,
+                telemetry: None,
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: Some("BMC HTTPS is unreachable".to_owned()),
+            }));
+        }
+    };
+    if managed.certificate_fingerprint.is_none() {
+        managed = state
+            .inventory
+            .set_certificate_fingerprint(&identity, &fingerprint.sha256)
+            .map_err(inventory_api_error)?;
+    }
+
+    let credentials = credentials_for_managed_bmc(state.as_ref(), &managed).await?;
+    let client = RedfishClient::for_ipv4_with_fingerprint(
+        managed.current_ip,
+        &credentials,
+        managed.certificate_fingerprint.as_deref(),
+    )
+    .map_err(workflow_redfish_api_error)?;
+    match client
+        .telemetry_with_model_hint(managed.hardware_model.as_deref())
+        .await
+    {
+        Ok(telemetry) => {
+            state
+                .inventory
+                .record_hardware_identity(
+                    &identity,
+                    managed.current_ip,
+                    telemetry.bmc_mac.as_deref(),
+                    telemetry.serial_number.as_deref(),
+                    telemetry.model.as_deref(),
+                )
+                .map_err(inventory_api_error)?;
+            state
+                .inventory
+                .record_telemetry(
+                    &identity,
+                    telemetry.power_watts,
+                    telemetry.temperature_celsius,
+                )
+                .map_err(inventory_api_error)?;
+            let managed = state
+                .inventory
+                .record_health(&identity, "online", "reachable", "success", None)
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedTelemetryResponse {
+                managed,
+                telemetry: Some(telemetry),
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: None,
+            }))
+        }
+        Err(bmc_provisioner::redfish::RedfishError::AuthenticationFailed) => {
+            let managed = state
+                .inventory
+                .record_health(
+                    &identity,
+                    "online",
+                    "reachable",
+                    "failed",
+                    Some("Redfish authentication failed during telemetry collection"),
+                )
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedTelemetryResponse {
+                managed,
+                telemetry: None,
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: Some("Redfish credential authentication failed".to_owned()),
+            }))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, ip = %managed.current_ip, "could not collect BMC telemetry");
+            let managed = state
+                .inventory
+                .record_health(
+                    &identity,
+                    "online",
+                    "reachable",
+                    "unknown",
+                    Some("Redfish telemetry collection failed"),
+                )
+                .map_err(inventory_api_error)?;
+            Ok(Json(ManagedTelemetryResponse {
+                managed,
+                telemetry: None,
+                certificate_fingerprint: None,
+                certificate_trust_required: false,
+                detail: Some("BMC did not provide a usable standard telemetry summary".to_owned()),
+            }))
+        }
+    }
+}
+
 /// Executes only a capability-advertised standard ComputerSystem.Reset action. The controller's
 /// own allowable ResetType list selects the exact vendor-compatible spelling.
 async fn managed_power_command(
@@ -1806,12 +2262,11 @@ async fn managed_power_command(
         .find(&identity)
         .map_err(inventory_api_error)?
         .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
-    let fingerprint = managed.certificate_fingerprint.as_deref().ok_or_else(|| {
-        ApiError::unprocessable(
-            "read BMC status and explicitly confirm its certificate before power control",
-        )
-    })?;
-    let credentials = credentials_for_profile(state.as_ref(), &managed.credential_profile).await?;
+    let fingerprint = managed
+        .certificate_fingerprint
+        .as_deref()
+        .ok_or_else(|| ApiError::unprocessable("refresh BMC status before power control"))?;
+    let credentials = credentials_for_managed_bmc(state.as_ref(), &managed).await?;
     let client = RedfishClient::for_ipv4_with_fingerprint(
         managed.current_ip,
         &credentials,

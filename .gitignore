@@ -8,5 +8,6 @@ ui/src-tauri/icons/*.icns
 ui/src-tauri/icons/android/
 ui/src-tauri/icons/ios/
 .env
+/secrets/
 .idea/
 .vscode/

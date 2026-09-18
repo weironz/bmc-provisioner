@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "bmc-provisioner",
-  "version": "0.1.10",
+  "productName": "BMC Fleet Console",
+  "version": "0.1.11",
   "identifier": "io.bmc-provisioner.desktop",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "bun run service:build && bun run dev",
     "beforeBuildCommand": "bun run build",
     "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../dist"
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "bmc-provisioner",
+        "title": "BMC Fleet Console",
         "width": 1080,
         "height": 820,
         "minWidth": 760,
@@ -37,8 +37,8 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
-    "shortDescription": "单台 BMC 初始配置工具",
-    "longDescription": "从 lessor 获取已确认 BMC 的 DHCP 地址，再通过 Redfish 修改密码和静态 IPv4 配置。",
+    "shortDescription": "裸金属 BMC 舰队管理控制台",
+    "longDescription": "按集群纳管裸金属服务器 BMC，并通过 Redfish 完成批量电源控制、基础硬件监控与网络配置。",
     "icon": ["icons/icon.ico"],
     "externalBin": ["binaries/bmc-provisionerd"],
     "createUpdaterArtifacts": true

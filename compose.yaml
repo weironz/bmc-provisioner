@@ -39,12 +39,24 @@ services:
       - /tmp
     volumes:
       - bmc-provisioner-data:/var/lib/bmc-provisioner
+    secrets:
+      - source: bmc-provisioner-master-key
+        target: bmc-provisioner-master-key
+        mode: 0400
     environment:
       BMC_PROVISIONER_BIND: 0.0.0.0:6770
       LOCALAPPDATA: /var/lib/bmc-provisioner
-      # Docker 默认没有系统密钥链；密码仅保留在服务内存至容器重启。
+      # Password ciphertext stays in the persistent SQLite volume; this mounted secret is the
+      # separate master key required to decrypt it after a container restart.
+      BMC_PROVISIONER_MASTER_KEY_FILE: /run/secrets/bmc-provisioner-master-key
+      # Legacy Lessor initialization profiles remain session-scoped in containers. A completed
+      # BMC is immediately promoted to its own durable encrypted device credential.
       BMC_PROVISIONER_SESSION_CREDENTIALS: "1"
 
 volumes:
   lessord-data:
   bmc-provisioner-data:
+
+secrets:
+  bmc-provisioner-master-key:
+    file: ${BMC_PROVISIONER_MASTER_KEY_FILE:-./secrets/bmc-provisioner-master-key}

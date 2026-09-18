@@ -17,6 +17,23 @@ use tokio_rustls::TlsConnector;
 
 use crate::model::{Credentials, StaticNetwork};
 
+mod gpu;
+mod identity;
+/// Prefer an actual current reading; limits, averages and HGX-only power are not substitutes.
+fn current_chassis_power(resource: &Value) -> Option<f64> {
+    let entry = resource.get("PowerControl")?.as_array()?.first()?;
+    entry
+        .get("PowerConsumedWatts")
+        .and_then(number_as_f64)
+        .or_else(|| {
+            entry
+                .pointer("/PowerMetrics/CurConsumedWatts")
+                .and_then(number_as_f64)
+        })
+        .filter(|watts| watts.is_finite() && *watts >= 0.0)
+}
+pub use gpu::GpuTelemetry;
+
 /// Standard Redfish resources discovered dynamically from the Service Root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RedfishInventory {
@@ -52,6 +69,9 @@ pub enum PowerAction {
     On,
     Shutdown,
     Restart,
+    ForceOff,
+    ForceRestart,
+    PowerCycle,
 }
 
 /// Read-only power capability returned by a BMC's ComputerSystem resource.
@@ -61,6 +81,66 @@ pub struct PowerStatus {
     pub system_uri: String,
     pub power_state: Option<String>,
     pub supported_actions: Vec<PowerAction>,
+}
+
+/// A compact inventory and health summary assembled from standard Redfish resources. The B300
+/// layout is handled explicitly: it has both an HGX baseboard and a host `System_0`; only the
+/// latter contains the server CPUs, DDR memory and storage inventory. Optional values stay absent
+/// when firmware does not publish the corresponding resource; callers must never mistake a
+/// missing metric for zero.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetrySnapshot {
+    pub system_uri: String,
+    pub name: Option<String>,
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub serial_number: Option<String>,
+    pub bmc_mac: Option<String>,
+    pub power_state: Option<String>,
+    pub health: Option<String>,
+    pub power_watts: Option<f64>,
+    pub temperature_celsius: Option<f64>,
+    pub cpu: CpuTelemetry,
+    pub memory: MemoryTelemetry,
+    pub storage: StorageTelemetry,
+    pub gpu: GpuTelemetry,
+    pub hardware: HardwareTelemetry,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwareTelemetry {
+    pub fans: Vec<Value>,
+    pub power_supplies: Vec<Value>,
+    pub drives: Vec<Value>,
+    pub network_ports: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuTelemetry {
+    pub packages: usize,
+    pub cores: Option<u64>,
+    pub threads: Option<u64>,
+    pub model: Option<String>,
+    pub health: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTelemetry {
+    pub modules: usize,
+    pub capacity_mib: Option<u64>,
+    pub health: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageTelemetry {
+    pub drives: usize,
+    pub capacity_bytes: Option<u64>,
+    pub health: Option<String>,
 }
 
 /// A successful reset request. Redfish may apply it asynchronously, so callers should refresh
@@ -119,22 +199,31 @@ impl CertificateFingerprint {
 /// proof of private-key possession; only chain and hostname validation are deferred to explicit
 /// user fingerprint confirmation.
 pub async fn probe_certificate(ip: Ipv4Addr) -> Result<CertificateFingerprint, RedfishError> {
-    let stream = tokio::net::TcpStream::connect((ip, 443))
-        .await
-        .map_err(RedfishError::CertificateProbe)?;
-    let configuration = pinned_tls_config(None);
-    let connector = TlsConnector::from(Arc::new(configuration));
-    let connection = connector
-        .connect(ServerName::from(ip), stream)
-        .await
-        .map_err(RedfishError::CertificateProbe)?;
-    let certificate = connection
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|certificates| certificates.first())
-        .ok_or(RedfishError::CertificateMissing)?;
-    Ok(CertificateFingerprint::from_der(certificate.as_ref()))
+    tokio::time::timeout(Duration::from_millis(3500), async {
+        let stream = tokio::net::TcpStream::connect((ip, 443))
+            .await
+            .map_err(RedfishError::CertificateProbe)?;
+        let configuration = pinned_tls_config(None);
+        let connector = TlsConnector::from(Arc::new(configuration));
+        let connection = connector
+            .connect(ServerName::from(ip), stream)
+            .await
+            .map_err(RedfishError::CertificateProbe)?;
+        let certificate = connection
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .ok_or(RedfishError::CertificateMissing)?;
+        Ok(CertificateFingerprint::from_der(certificate.as_ref()))
+    })
+    .await
+    .map_err(|_| {
+        RedfishError::CertificateProbe(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "certificate probe timed out",
+        ))
+    })?
 }
 
 /// Redfish client using HTTP Basic authentication. Certificate validation remains enabled.
@@ -345,25 +434,369 @@ impl RedfishClient {
         })
     }
 
+    /// Read the hardware summary used by the fleet console. The root and selected
+    /// ComputerSystem are required, while child collections are deliberately best-effort: Redfish
+    /// implementations frequently omit Storage, Chassis/Power, or Thermal resources.
+    pub async fn telemetry(&self) -> Result<TelemetrySnapshot, RedfishError> {
+        self.telemetry_with_model_hint(None).await
+    }
+
+    pub async fn telemetry_with_model_hint(
+        &self,
+        model_hint: Option<&str>,
+    ) -> Result<TelemetrySnapshot, RedfishError> {
+        let root: ServiceRoot = self.get_json("/redfish/v1/").await?;
+        let systems = root.systems.ok_or(RedfishError::NoComputerSystem)?;
+        let systems: Collection = self.get_json(&systems.odata_id).await?;
+        let b300_layout = systems
+            .members
+            .iter()
+            .any(|member| member.odata_id.ends_with("/HGX_Baseboard_0"));
+        let system = selected_system(&systems)?;
+        let resource: Value = self.get_json(&system.odata_id).await?;
+
+        // Collect core identity and whole-server readings before optional drive/GPU walks.
+        let (model, serial_number, bmc_mac) = self.hardware_identity(&resource, model_hint).await;
+        let (power_watts, temperature_celsius, mut hardware) = if b300_layout {
+            self.b300_environment().await
+        } else {
+            let chassis = self
+                .collection_values(root.chassis.as_ref().map(|link| link.odata_id.as_str()))
+                .await;
+            self.chassis_environment(&chassis).await
+        };
+        // Read accelerator metrics before optional disk endpoints: some AMI NVMe handlers
+        // stall and temporarily exhaust firmware authentication/session capacity.
+        let gpu = self
+            .gpu_telemetry(&systems, &system.odata_id, &resource)
+            .await;
+
+        let (processors, memory, storage) = if b300_layout {
+            // AMI's B300 BMC can stall when dozens of individual processor or DIMM resources
+            // are read serially. It supports standard expansion, which keeps each collection to
+            // one bounded request and avoids overwhelming its small Redfish session pool.
+            tokio::join!(
+                self.expanded_collection_values(resource_link(&resource, "Processors")),
+                self.expanded_collection_values(resource_link(&resource, "Memory")),
+                self.expanded_collection_values(resource_link(&resource, "Storage")),
+            )
+        } else {
+            (
+                self.collection_values(resource_link(&resource, "Processors"))
+                    .await,
+                self.collection_values(resource_link(&resource, "Memory"))
+                    .await,
+                self.collection_values(resource_link(&resource, "Storage"))
+                    .await,
+            )
+        };
+        let drive_links = link_array(&storage, "Drives");
+        let drives = if b300_layout {
+            self.resources_with_limit(drive_links, 3).await
+        } else {
+            self.resources(drive_links).await
+        };
+        let host_processors = only_cpu_processors(&processors);
+        let host_memory = only_host_memory(&memory);
+
+        let cpu_cores = sum_u64(&host_processors, "TotalCores");
+        let cpu_threads = sum_u64(&host_processors, "TotalThreads");
+        let memory_capacity = sum_u64(&host_memory, "CapacityMiB").or_else(|| {
+            resource
+                .pointer("/MemorySummary/TotalSystemMemoryGiB")
+                .and_then(number_as_u64)
+                .and_then(|gib| gib.checked_mul(1024))
+        });
+        let storage_capacity = sum_u64(&drives, "CapacityBytes");
+        hardware.drives = drives.iter().map(|drive| json!({
+            "name": drive.get("Name"), "model": drive.get("Model"),
+            "health": drive.pointer("/Status/Health"), "state": drive.pointer("/Status/State"),
+            "capacityBytes": drive.get("CapacityBytes"),
+            "lifeLeftPercent": drive.get("PredictedMediaLifeLeftPercent"),
+            "failurePredicted": drive.get("FailurePredicted")
+        })).collect();
+        if let Some(uri) = resource_link(&resource, "EthernetInterfaces") {
+            let ports = self.collection_values(Some(uri)).await;
+            hardware.network_ports = ports
+                .iter()
+                .map(|port| {
+                    json!({
+                        "name": port.get("Name"), "linkStatus": port.get("LinkStatus"),
+                        "speedMbps": port.get("SpeedMbps"), "mac": port.get("MACAddress"),
+                        "health": port.pointer("/Status/Health")
+                    })
+                })
+                .collect();
+        }
+
+        Ok(TelemetrySnapshot {
+            system_uri: system.odata_id.clone(),
+            name: string_field(&resource, "Name"),
+            manufacturer: string_field(&resource, "Manufacturer"),
+            model,
+            serial_number,
+            bmc_mac,
+            power_state: string_field(&resource, "PowerState"),
+            health: status_health(&[resource.clone()]),
+            power_watts,
+            temperature_celsius,
+            gpu,
+            hardware,
+            cpu: CpuTelemetry {
+                packages: host_processors.len().max(
+                    resource
+                        .pointer("/ProcessorSummary/Count")
+                        .and_then(number_as_u64)
+                        .unwrap_or_default() as usize,
+                ),
+                cores: cpu_cores,
+                threads: cpu_threads,
+                model: host_processors
+                    .iter()
+                    .find_map(|processor| string_field(processor, "Model"))
+                    .or_else(|| {
+                        resource
+                            .pointer("/ProcessorSummary/Model")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    }),
+                health: status_health(&host_processors),
+            },
+            memory: MemoryTelemetry {
+                modules: host_memory.len(),
+                capacity_mib: memory_capacity,
+                health: status_health(&host_memory),
+            },
+            storage: StorageTelemetry {
+                drives: drives.len(),
+                capacity_bytes: storage_capacity,
+                health: status_health(&drives),
+            },
+        })
+    }
+
     async fn power_system(&self) -> Result<PowerSystem, RedfishError> {
         let root: ServiceRoot = self.get_json("/redfish/v1/").await?;
         let systems = root.systems.ok_or(RedfishError::NoComputerSystem)?;
         let systems: Collection = self.get_json(&systems.odata_id).await?;
-        let system = systems
-            .members
-            .into_iter()
-            .next()
-            .ok_or(RedfishError::NoComputerSystem)?;
+        let system = selected_system(&systems)?;
         let response: ComputerSystem = self.get_json(&system.odata_id).await?;
+        // Log the full Actions structure to diagnose B300
+        tracing::debug!(
+            "BMC ComputerSystem raw Actions: {}",
+            serde_json::to_string_pretty(&response.actions).unwrap_or_else(|_| "{}".to_string())
+        );
+
+        // Only expose actions the selected host actually declares.
         let reset = response.reset_action();
+        let mut allowable_types = reset
+            .as_ref()
+            .map(|action| action.allowable_reset_types.clone())
+            .unwrap_or_default();
+        // Redfish deprecated the inline `ResetType@Redfish.AllowableValues` annotation in favor
+        // of a separate ActionInfo resource. Firmware that publishes only the latter would
+        // otherwise look like a controller that supports no power operation at all.
+        if allowable_types.is_empty()
+            && let Some(action_info) = reset
+                .as_ref()
+                .and_then(|action| action.action_info_uri.as_deref())
+        {
+            match self.get_json::<ActionInfo>(action_info).await {
+                Ok(info) => allowable_types = info.reset_type_allowable_values(),
+                // An unreadable ActionInfo is not a reason to fail the whole status read: the
+                // caller still gets PowerState, and simply no action is offered.
+                Err(error) => {
+                    tracing::debug!("could not read ResetType ActionInfo {action_info}: {error}")
+                }
+            }
+        }
+        tracing::debug!(
+            "BMC ComputerSystem: uri={}, power_state={:?}, reset_target={:?}, allowable_reset_types={:?}",
+            system.odata_id,
+            response.power_state,
+            reset.as_ref().map(|a| &a.target),
+            allowable_types
+        );
         Ok(PowerSystem {
-            uri: system.odata_id,
+            uri: system.odata_id.clone(),
             power_state: response.power_state,
             reset_target: reset.as_ref().map(|action| action.target.clone()),
-            allowable_reset_types: reset
-                .map(|action| action.allowable_reset_types)
-                .unwrap_or_default(),
+            allowable_reset_types: allowable_types,
         })
+    }
+
+    async fn collection_values(&self, resource: Option<&str>) -> Vec<Value> {
+        let Some(resource) = resource else {
+            return Vec::new();
+        };
+        let collection = match self.get_json::<Collection>(resource).await {
+            Ok(collection) => collection,
+            Err(error) => {
+                tracing::debug!(resource, error = %error, "optional Redfish collection could not be read");
+                return Vec::new();
+            }
+        };
+        self.resources(
+            collection
+                .members
+                .into_iter()
+                .map(|member| member.odata_id)
+                .collect(),
+        )
+        .await
+    }
+
+    /// Read the immediate collection members in one request. B300 supports `$expand` on its
+    /// host collections and this is intentionally used only for its detected HGX layout.
+    async fn expanded_collection_values(&self, resource: Option<&str>) -> Vec<Value> {
+        let Some(resource) = resource else {
+            return Vec::new();
+        };
+        let expanded = format!("{resource}?$expand=*($levels=1)");
+        match self.get_json::<Value>(&expanded).await {
+            Ok(collection) => collection
+                .get("Members")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => {
+                tracing::debug!(resource, error = %error, "expanded B300 Redfish collection could not be read");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn resources(&self, resources: Vec<String>) -> Vec<Value> {
+        let mut values = Vec::with_capacity(resources.len());
+        for resource in resources {
+            match self.get_json::<Value>(&resource).await {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    tracing::debug!(resource, error = %error, "optional Redfish resource could not be read")
+                }
+            }
+        }
+        values
+    }
+
+    /// BMC controllers have a small HTTP/session budget. A bounded fan-out gathers storage
+    /// details without turning a ten-drive system into a long serial scrape or a 403 storm.
+    async fn resources_with_limit(&self, resources: Vec<String>, limit: usize) -> Vec<Value> {
+        let mut pending = resources.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut values = Vec::new();
+        for _ in 0..limit.max(1) {
+            let Some(resource) = pending.next() else {
+                break;
+            };
+            let client = self.clone();
+            tasks.spawn(async move { client.optional_inventory_value(&resource).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(Some(value)) = result {
+                values.push(value);
+            }
+            if let Some(resource) = pending.next() {
+                let client = self.clone();
+                tasks.spawn(async move { client.optional_inventory_value(&resource).await });
+            }
+        }
+        values
+    }
+
+    async fn optional_inventory_value(&self, resource: &str) -> Option<Value> {
+        match tokio::time::timeout(Duration::from_secs(4), self.optional_value(resource)).await {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::debug!(
+                    resource,
+                    "optional inventory read exceeded four-second budget"
+                );
+                None
+            }
+        }
+    }
+
+    async fn chassis_environment(
+        &self,
+        chassis: &[Value],
+    ) -> (Option<f64>, Option<f64>, HardwareTelemetry) {
+        let Some(chassis) = chassis.first() else {
+            return (None, None, HardwareTelemetry::default());
+        };
+        let power = match resource_link(chassis, "Power") {
+            Some(uri) => match self.get_json::<Value>(uri).await {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::debug!(resource = uri, error = %error, "optional Redfish power resource could not be read");
+                    None
+                }
+            },
+            None => None,
+        };
+        let thermal = match resource_link(chassis, "Thermal") {
+            Some(uri) => match self.get_json::<Value>(uri).await {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::debug!(resource = uri, error = %error, "optional Redfish thermal resource could not be read");
+                    None
+                }
+            },
+            None => None,
+        };
+        let power_watts = power.as_ref().and_then(current_chassis_power);
+        let temperature_celsius = thermal.as_ref().and_then(|resource| {
+            resource
+                .get("Temperatures")
+                .and_then(Value::as_array)
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.get("ReadingCelsius").and_then(number_as_f64))
+                        .max_by(f64::total_cmp)
+                })
+        });
+        (
+            power_watts,
+            temperature_celsius,
+            hardware_environment(power.as_ref(), thermal.as_ref()),
+        )
+    }
+
+    /// HGX EnvironmentMetrics measures the accelerator baseboard, not the whole server.
+    /// Whole-server power and thermals are published by the BMC chassis.
+    async fn b300_environment(&self) -> (Option<f64>, Option<f64>, HardwareTelemetry) {
+        let (thermal, power) = tokio::join!(
+            self.optional_value("/redfish/v1/Chassis/BMC_0/Thermal"),
+            self.optional_value("/redfish/v1/Chassis/BMC_0/Power"),
+        );
+        let power_watts = power.as_ref().and_then(current_chassis_power);
+        let temperature_celsius = thermal.as_ref().and_then(|resource| {
+            resource
+                .get("Temperatures")
+                .and_then(Value::as_array)
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.get("ReadingCelsius").and_then(number_as_f64))
+                        .max_by(f64::total_cmp)
+                })
+        });
+        (
+            power_watts,
+            temperature_celsius,
+            hardware_environment(power.as_ref(), thermal.as_ref()),
+        )
+    }
+
+    async fn optional_value(&self, resource: &str) -> Option<Value> {
+        match self.get_json(resource).await {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::debug!(resource, error = %error, "optional Redfish resource could not be read");
+                None
+            }
+        }
     }
 
     pub async fn change_password(
@@ -500,7 +933,10 @@ impl RedfishClient {
         &self,
         resource: &str,
     ) -> Result<T, RedfishError> {
+        let read_lock = self.read_lock();
+        let _guard = read_lock.lock().await;
         let url = self.resource_url(resource)?;
+        tracing::debug!(resource, "reading Redfish resource");
         let response = self
             .client
             .get(url)
@@ -617,12 +1053,12 @@ fn https_client_with_options(
     fingerprint: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<reqwest::Client, RedfishError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
-    if let Some(timeout) = timeout {
-        builder = builder
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(timeout);
-    }
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(3))
+        // Monitoring must eventually return control to its automatic scheduler. A BMC can accept
+        // TLS and then leave an individual Redfish resource hanging indefinitely.
+        .timeout(timeout.unwrap_or(Duration::from_secs(15)));
     match fingerprint {
         Some(fingerprint) => {
             let fingerprint = CertificateFingerprint::parse(fingerprint)?;
@@ -830,19 +1266,35 @@ fn static_ipv4_payload(network: &StaticNetwork) -> Value {
 }
 
 fn supported_power_actions(allowable_reset_types: &[String]) -> Vec<PowerAction> {
-    [PowerAction::On, PowerAction::Shutdown, PowerAction::Restart]
-        .into_iter()
-        .filter(|action| select_reset_type(*action, allowable_reset_types).is_some())
-        .collect()
+    let result: Vec<PowerAction> = [
+        PowerAction::On,
+        PowerAction::Shutdown,
+        PowerAction::Restart,
+        PowerAction::ForceOff,
+        PowerAction::ForceRestart,
+        PowerAction::PowerCycle,
+    ]
+    .into_iter()
+    .filter(|action| select_reset_type(*action, allowable_reset_types).is_some())
+    .collect();
+    tracing::debug!(
+        "Mapped allowable_reset_types={:?} to supported_actions={:?}",
+        allowable_reset_types,
+        result
+    );
+    result
 }
 
-/// Prefer graceful operations where the firmware offers them, then use the B300-compatible
-/// forced variant as an explicit fallback. The actual selection is returned to the UI.
+/// Graceful and forced operations are separate operator choices; never escalate implicitly.
+/// `PushPowerButton` is deliberately never used: it toggles rather than reaching a known state.
 fn select_reset_type(action: PowerAction, allowable_reset_types: &[String]) -> Option<&str> {
     let preferred: &[&str] = match action {
-        PowerAction::On => &["On"],
-        PowerAction::Shutdown => &["GracefulShutdown", "ForceOff"],
-        PowerAction::Restart => &["GracefulRestart", "ForceRestart"],
+        PowerAction::On => &["On", "ForceOn"],
+        PowerAction::Shutdown => &["GracefulShutdown"],
+        PowerAction::Restart => &["GracefulRestart"],
+        PowerAction::ForceOff => &["ForceOff"],
+        PowerAction::ForceRestart => &["ForceRestart"],
+        PowerAction::PowerCycle => &["PowerCycle"],
     };
     preferred.iter().find_map(|candidate| {
         allowable_reset_types
@@ -1005,6 +1457,8 @@ struct ServiceRoot {
     managers: Link,
     #[serde(rename = "Systems", default)]
     systems: Option<Link>,
+    #[serde(rename = "Chassis", default)]
+    chassis: Option<Link>,
 }
 
 #[derive(Deserialize)]
@@ -1017,6 +1471,137 @@ struct AccountService {
 struct Collection {
     #[serde(rename = "Members")]
     members: Vec<Link>,
+}
+
+/// Select the host ComputerSystem when a BMC publishes auxiliary systems as well. NVIDIA HGX
+/// controllers list `HGX_Baseboard_0` before their actual host `System_0`; choosing the first
+/// member would incorrectly turn GPU/HBM inventory into CPU/DDR telemetry.
+fn selected_system(systems: &Collection) -> Result<&Link, RedfishError> {
+    systems
+        .members
+        .iter()
+        .find(|member| member.odata_id.ends_with("/System_0"))
+        .or_else(|| systems.members.first())
+        .ok_or(RedfishError::NoComputerSystem)
+}
+
+fn only_cpu_processors(processors: &[Value]) -> Vec<Value> {
+    let cpu_processors: Vec<Value> = processors
+        .iter()
+        .filter(|processor| string_field(processor, "ProcessorType").as_deref() == Some("CPU"))
+        .cloned()
+        .collect();
+    if cpu_processors.is_empty() {
+        processors.to_vec()
+    } else {
+        cpu_processors
+    }
+}
+
+fn only_host_memory(memory: &[Value]) -> Vec<Value> {
+    let host_memory: Vec<Value> = memory
+        .iter()
+        .filter(|module| string_field(module, "MemoryDeviceType").as_deref() != Some("HBM"))
+        .cloned()
+        .collect();
+    if host_memory.is_empty() {
+        memory.to_vec()
+    } else {
+        host_memory
+    }
+}
+
+fn hardware_environment(power: Option<&Value>, thermal: Option<&Value>) -> HardwareTelemetry {
+    let fans = thermal.and_then(|v| v.get("Fans")).and_then(Value::as_array)
+        .map(|fans| fans.iter().map(|fan| json!({
+            "name": fan.get("Name"), "reading": fan.get("Reading"), "units": fan.get("ReadingUnits"),
+            "health": fan.pointer("/Status/Health"), "state": fan.pointer("/Status/State")
+        })).collect()).unwrap_or_default();
+    let power_supplies = power.and_then(|v| v.get("PowerSupplies")).and_then(Value::as_array)
+        .map(|supplies| supplies.iter().map(|supply| json!({
+            "name": supply.get("Name"), "model": supply.get("Model"),
+            "health": supply.pointer("/Status/Health"), "state": supply.pointer("/Status/State"),
+            "inputWatts": supply.get("PowerInputWatts"), "outputWatts": supply.get("PowerOutputWatts"),
+            "capacityWatts": supply.get("PowerCapacityWatts")
+        })).collect()).unwrap_or_default();
+    HardwareTelemetry {
+        fans,
+        power_supplies,
+        ..Default::default()
+    }
+}
+
+fn resource_link<'a>(resource: &'a Value, field: &str) -> Option<&'a str> {
+    resource.get(field).and_then(|link| {
+        link.as_str()
+            .or_else(|| link.get("@odata.id").and_then(Value::as_str))
+    })
+}
+
+fn link_array(resources: &[Value], field: &str) -> Vec<String> {
+    resources
+        .iter()
+        .flat_map(|resource| {
+            resource
+                .get(field)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|link| {
+                    link.as_str()
+                        .or_else(|| link.get("@odata.id").and_then(Value::as_str))
+                        .map(ToOwned::to_owned)
+                })
+        })
+        .collect()
+}
+
+fn string_field(resource: &Value, field: &str) -> Option<String> {
+    resource
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn number_as_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|number| *number >= 0.0)
+            .map(|number| number as u64)
+    })
+}
+
+fn number_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_u64().map(|number| number as f64))
+}
+
+fn sum_u64(resources: &[Value], field: &str) -> Option<u64> {
+    let mut found = false;
+    let total = resources
+        .iter()
+        .filter_map(|resource| {
+            resource
+                .get(field)
+                .and_then(number_as_u64)
+                .inspect(|_| found = true)
+        })
+        .sum();
+    found.then_some(total)
+}
+
+fn status_health(resources: &[Value]) -> Option<String> {
+    let values: Vec<&str> = resources
+        .iter()
+        .filter_map(|resource| resource.pointer("/Status/Health").and_then(Value::as_str))
+        .collect();
+    values
+        .iter()
+        .find(|health| !matches!(**health, "OK" | "Unknown"))
+        .or_else(|| values.first())
+        .map(|health| (*health).to_owned())
 }
 
 #[derive(Deserialize)]
@@ -1043,27 +1628,85 @@ struct ComputerSystem {
 struct ResetAction {
     target: String,
     allowable_reset_types: Vec<String>,
+    /// Set when the firmware publishes its allowable values in a separate ActionInfo resource
+    /// instead of the deprecated inline annotation.
+    action_info_uri: Option<String>,
 }
 
 impl ComputerSystem {
     fn reset_action(&self) -> Option<ResetAction> {
-        let action = self.actions.get("#ComputerSystem.Reset")?;
-        let target = action.get("target")?.as_str()?.to_owned();
-        let allowable_reset_types = action
-            .get("ResetType@Redfish.AllowableValues")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Some(ResetAction {
-            target,
-            allowable_reset_types,
-        })
+        // Try standard Redfish format: Actions["#ComputerSystem.Reset"]
+        if let Some(action) = self.actions.get("#ComputerSystem.Reset") {
+            if let Some(target) = action.get("target").and_then(Value::as_str) {
+                let allowable_reset_types = action
+                    .get("ResetType@Redfish.AllowableValues")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Some(ResetAction {
+                    target: target.to_owned(),
+                    allowable_reset_types,
+                    action_info_uri: action_info_uri(action),
+                });
+            }
+        }
+
+        // Fallback: try Oem vendor extensions for B300-like implementations
+        // Some BMC implementations put reset actions under Oem paths
+        if let Some(oem) = self.actions.get("Oem") {
+            tracing::debug!("ComputerSystem has Oem actions, checking for vendor reset actions");
+            // Log available OEM actions for debugging
+            if let Some(obj) = oem.as_object() {
+                tracing::debug!(
+                    "Available Oem vendors: {:?}",
+                    obj.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        None
+    }
+}
+
+/// `@Redfish.ActionInfo` is specified as a URI string. The object form is also accepted because
+/// some implementations serialize it the way they serialize a resource link.
+fn action_info_uri(action: &Value) -> Option<String> {
+    let value = action.get("@Redfish.ActionInfo")?;
+    value
+        .as_str()
+        .or_else(|| value.get("@odata.id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+/// The standard resource that replaced inline action annotations. Only the `ResetType`
+/// parameter is read; nothing here is vendor-specific.
+#[derive(Deserialize)]
+struct ActionInfo {
+    #[serde(rename = "Parameters", default)]
+    parameters: Vec<ActionParameter>,
+}
+
+#[derive(Deserialize)]
+struct ActionParameter {
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "AllowableValues", default)]
+    allowable_values: Vec<String>,
+}
+
+impl ActionInfo {
+    fn reset_type_allowable_values(self) -> Vec<String> {
+        self.parameters
+            .into_iter()
+            .find(|parameter| parameter.name.as_deref() == Some("ResetType"))
+            .map(|parameter| parameter.allowable_values)
+            .unwrap_or_default()
     }
 }
 
@@ -1211,11 +1854,377 @@ mod tests {
         assert_eq!(status.power_state.as_deref(), Some("Off"));
         assert_eq!(
             status.supported_actions,
-            vec![PowerAction::On, PowerAction::Shutdown, PowerAction::Restart]
+            vec![
+                PowerAction::On,
+                PowerAction::ForceOff,
+                PowerAction::ForceRestart
+            ]
         );
-        let result = client.set_power(PowerAction::Restart).await.unwrap();
+        // A graceful request must not POST a forced reset, even on forced-only firmware.
+        assert!(matches!(
+            client.set_power(PowerAction::Restart).await,
+            Err(RedfishError::UnsupportedPowerAction(PowerAction::Restart))
+        ));
+        assert!(matches!(
+            client.set_power(PowerAction::Shutdown).await,
+            Err(RedfishError::UnsupportedPowerAction(PowerAction::Shutdown))
+        ));
+        let result = client.set_power(PowerAction::ForceRestart).await.unwrap();
         assert_eq!(result.reset_type, "ForceRestart");
         server.verify().await;
+    }
+
+    #[test]
+    fn power_intents_do_not_escalate_to_other_reset_types() {
+        let cases = [
+            (PowerAction::On, "On"),
+            (PowerAction::Shutdown, "GracefulShutdown"),
+            (PowerAction::Restart, "GracefulRestart"),
+            (PowerAction::ForceOff, "ForceOff"),
+            (PowerAction::ForceRestart, "ForceRestart"),
+            (PowerAction::PowerCycle, "PowerCycle"),
+        ];
+        for (intent, reset_type) in cases {
+            let advertised = vec![reset_type.to_owned()];
+            assert_eq!(select_reset_type(intent, &advertised), Some(reset_type));
+            for (other_intent, _) in cases {
+                if other_intent != intent {
+                    assert_eq!(select_reset_type(other_intent, &advertised), None);
+                }
+            }
+        }
+        // FullPowerCycle can affect the manager itself and is not an alias for host PowerCycle.
+        assert!(
+            supported_power_actions(&["FullPowerCycle".into(), "PushPowerButton".into()])
+                .is_empty()
+        );
+    }
+
+    /// Redfish deprecated the inline allowable-values annotation. A BMC that only publishes the
+    /// ActionInfo resource still advertises real power capabilities and must not be treated as
+    /// a controller without any supported reset.
+    #[tokio::test]
+    async fn reads_allowable_reset_types_from_a_separate_action_info_resource() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "AccountService": { "@odata.id": "/redfish/v1/AccountService" },
+                "Managers": { "@odata.id": "/redfish/v1/Managers" },
+                "Systems": { "@odata.id": "/redfish/v1/Systems" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{ "@odata.id": "/redfish/v1/Systems/Self" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/Self"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "PowerState": "On",
+                "Actions": {
+                    "#ComputerSystem.Reset": {
+                        "target": "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset",
+                        "@Redfish.ActionInfo": "/redfish/v1/Systems/Self/ResetActionInfo"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/Self/ResetActionInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Parameters": [
+                    { "Name": "ResetType", "DataType": "String", "Required": true,
+                      "AllowableValues": ["On", "ForceOff", "GracefulShutdown", "PowerCycle"] }
+                ]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset",
+            ))
+            .and(body_json(json!({ "ResetType": "PowerCycle" })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let status = client.power_status().await.unwrap();
+        assert_eq!(
+            status.supported_actions,
+            vec![
+                PowerAction::On,
+                PowerAction::Shutdown,
+                PowerAction::ForceOff,
+                PowerAction::PowerCycle
+            ]
+        );
+        let result = client.set_power(PowerAction::PowerCycle).await.unwrap();
+        assert_eq!(result.reset_type, "PowerCycle");
+        server.verify().await;
+    }
+
+    /// A ComputerSystem that neither inlines allowable values nor points at an ActionInfo must
+    /// offer nothing rather than have a ResetType guessed on its behalf.
+    #[tokio::test]
+    async fn offers_no_power_action_when_the_bmc_declares_no_reset_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "AccountService": { "@odata.id": "/redfish/v1/AccountService" },
+                "Managers": { "@odata.id": "/redfish/v1/Managers" },
+                "Systems": { "@odata.id": "/redfish/v1/Systems" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{ "@odata.id": "/redfish/v1/Systems/1" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "PowerState": "On",
+                "Actions": {
+                    "#ComputerSystem.Reset": {
+                        "target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let status = client.power_status().await.unwrap();
+        assert_eq!(status.power_state.as_deref(), Some("On"));
+        assert!(status.supported_actions.is_empty());
+        assert!(matches!(
+            client.set_power(PowerAction::On).await,
+            Err(RedfishError::UnsupportedPowerAction(PowerAction::On))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reads_standard_hardware_telemetry() {
+        let server = MockServer::start().await;
+        let root = json!({
+            "AccountService": { "@odata.id": "/redfish/v1/AccountService" },
+            "Managers": { "@odata.id": "/redfish/v1/Managers" },
+            "Systems": { "@odata.id": "/redfish/v1/Systems" },
+            "Chassis": { "@odata.id": "/redfish/v1/Chassis" }
+        });
+        let systems = json!({ "Members": [{ "@odata.id": "/redfish/v1/Systems/1" }] });
+        let system = json!({
+            "Name": "GPU node 01",
+            "Manufacturer": "GreenStor",
+            "Model": "B300-8U",
+            "SerialNumber": "GS-0001",
+            "PowerState": "On",
+            "Status": { "Health": "OK" },
+            "ProcessorSummary": { "Count": 2, "Model": "fallback" },
+            "MemorySummary": { "TotalSystemMemoryGiB": 96 },
+            "Processors": { "@odata.id": "/redfish/v1/Systems/1/Processors" },
+            "Memory": { "@odata.id": "/redfish/v1/Systems/1/Memory" },
+            "Storage": { "@odata.id": "/redfish/v1/Systems/1/Storage" }
+        });
+        let chassis = json!({ "Members": [{ "@odata.id": "/redfish/v1/Chassis/1" }] });
+        let chassis_one = json!({
+            "Power": { "@odata.id": "/redfish/v1/Chassis/1/Power" },
+            "Thermal": { "@odata.id": "/redfish/v1/Chassis/1/Thermal" }
+        });
+        let processors = json!({ "Members": [
+            { "@odata.id": "/redfish/v1/Systems/1/Processors/CPU0" },
+            { "@odata.id": "/redfish/v1/Systems/1/Processors/CPU1" }
+        ] });
+        let memory = json!({ "Members": [
+            { "@odata.id": "/redfish/v1/Systems/1/Memory/DIMM0" },
+            { "@odata.id": "/redfish/v1/Systems/1/Memory/DIMM1" }
+        ] });
+        let storage = json!({ "Members": [{ "@odata.id": "/redfish/v1/Systems/1/Storage/1" }] });
+        let storage_one = json!({ "Drives": [
+            { "@odata.id": "/redfish/v1/Systems/1/Storage/1/Drives/0" },
+            { "@odata.id": "/redfish/v1/Systems/1/Storage/1/Drives/1" }
+        ] });
+
+        for (route, body) in [
+            ("/redfish/v1/", root),
+            ("/redfish/v1/Systems", systems),
+            ("/redfish/v1/Systems/1", system),
+            ("/redfish/v1/Chassis", chassis),
+            ("/redfish/v1/Chassis/1", chassis_one),
+            ("/redfish/v1/Systems/1/Processors", processors),
+            ("/redfish/v1/Systems/1/Memory", memory),
+            ("/redfish/v1/Systems/1/Storage", storage),
+            ("/redfish/v1/Systems/1/Storage/1", storage_one),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        for (route, body) in [
+            (
+                "/redfish/v1/Systems/1/Processors/CPU0",
+                json!({ "Model": "AMD EPYC", "TotalCores": 64, "TotalThreads": 128, "Status": { "Health": "OK" } }),
+            ),
+            (
+                "/redfish/v1/Systems/1/Processors/CPU1",
+                json!({ "Model": "AMD EPYC", "TotalCores": 64, "TotalThreads": 128, "Status": { "Health": "OK" } }),
+            ),
+            (
+                "/redfish/v1/Systems/1/Memory/DIMM0",
+                json!({ "CapacityMiB": 49152, "Status": { "Health": "OK" } }),
+            ),
+            (
+                "/redfish/v1/Systems/1/Memory/DIMM1",
+                json!({ "CapacityMiB": 49152, "Status": { "Health": "Warning" } }),
+            ),
+            (
+                "/redfish/v1/Systems/1/Storage/1/Drives/0",
+                json!({ "CapacityBytes": 1000, "Status": { "Health": "OK" } }),
+            ),
+            (
+                "/redfish/v1/Systems/1/Storage/1/Drives/1",
+                json!({ "CapacityBytes": 2000, "Status": { "Health": "Critical" } }),
+            ),
+            (
+                "/redfish/v1/Chassis/1/Power",
+                json!({ "PowerControl": [{ "PowerConsumedWatts": 1875.5 }] }),
+            ),
+            (
+                "/redfish/v1/Chassis/1/Thermal",
+                json!({ "Temperatures": [{ "ReadingCelsius": 42.0 }, { "ReadingCelsius": 57.5 }] }),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let telemetry = client.telemetry().await.unwrap();
+        assert_eq!(telemetry.name.as_deref(), Some("GPU node 01"));
+        assert_eq!(telemetry.power_watts, Some(1875.5));
+        assert_eq!(telemetry.temperature_celsius, Some(57.5));
+        assert_eq!(telemetry.cpu.packages, 2);
+        assert_eq!(telemetry.cpu.cores, Some(128));
+        assert_eq!(telemetry.memory.capacity_mib, Some(98_304));
+        assert_eq!(telemetry.memory.health.as_deref(), Some("Warning"));
+        assert_eq!(telemetry.storage.drives, 2);
+        assert_eq!(telemetry.storage.capacity_bytes, Some(3_000));
+        assert_eq!(telemetry.storage.health.as_deref(), Some("Critical"));
+    }
+
+    #[tokio::test]
+    async fn reads_b300_host_inventory_and_whole_server_power() {
+        let server = MockServer::start().await;
+        let root = json!({
+            "AccountService": { "@odata.id": "/redfish/v1/AccountService" },
+            "Managers": { "@odata.id": "/redfish/v1/Managers" },
+            "Systems": { "@odata.id": "/redfish/v1/Systems" },
+            "Chassis": { "@odata.id": "/redfish/v1/Chassis" }
+        });
+        // The baseboard is deliberately first: this is the layout that previously caused the
+        // fleet console to report GPU/HBM inventory as host CPU/DDR inventory.
+        let systems = json!({ "Members": [
+            { "@odata.id": "/redfish/v1/Systems/HGX_Baseboard_0" },
+            { "@odata.id": "/redfish/v1/Systems/System_0" }
+        ] });
+        let system = json!({
+            "Name": "System",
+            "Manufacturer": "ASRockRack",
+            "Model": "B300 8U16X-GNR2",
+            "PowerState": "On",
+            "Status": { "Health": "OK" },
+            "Processors": { "@odata.id": "/redfish/v1/Systems/System_0/Processors" },
+            "Memory": { "@odata.id": "/redfish/v1/Systems/System_0/Memory" },
+            "Storage": { "@odata.id": "/redfish/v1/Systems/System_0/Storage" }
+        });
+        let processors = json!({ "Members": [
+            { "@odata.id": "/redfish/v1/Systems/System_0/Processors/CPU_0", "ProcessorType": "CPU", "Model": "Xeon", "TotalCores": 64, "TotalThreads": 128, "Status": { "Health": "OK" } },
+            { "@odata.id": "/redfish/v1/Systems/System_0/Processors/CPU_1", "ProcessorType": "CPU", "Model": "Xeon", "TotalCores": 64, "TotalThreads": 128, "Status": { "Health": "OK" } },
+            { "@odata.id": "/redfish/v1/Systems/System_0/Processors/GPU_0", "ProcessorType": "GPU", "TotalCores": 9_999 }
+        ] });
+        let memory = json!({ "Members": [
+            { "@odata.id": "/redfish/v1/Systems/System_0/Memory/DIMM_0", "MemoryDeviceType": "DDR5", "CapacityMiB": 98_304, "Status": { "Health": "OK" } },
+            { "@odata.id": "/redfish/v1/Systems/System_0/Memory/HBM_0", "MemoryDeviceType": "HBM", "CapacityMiB": 81_920 }
+        ] });
+        let storage = json!({ "Members": [
+            { "@odata.id": "/redfish/v1/Systems/System_0/Storage/1", "Drives": [
+                { "@odata.id": "/redfish/v1/Systems/System_0/Storage/1/Drives/NVMe_0" }
+            ] }
+        ] });
+
+        for (route, body) in [
+            ("/redfish/v1/", root),
+            ("/redfish/v1/Systems", systems),
+            ("/redfish/v1/Systems/System_0", system),
+            ("/redfish/v1/Systems/System_0/Processors", processors),
+            ("/redfish/v1/Systems/System_0/Memory", memory),
+            ("/redfish/v1/Systems/System_0/Storage", storage),
+            (
+                "/redfish/v1/Chassis/HGX_Chassis_0/EnvironmentMetrics",
+                json!({ "PowerWatts": { "Reading": 2420.5 } }),
+            ),
+            (
+                "/redfish/v1/Chassis/BMC_0/Power",
+                json!({"PowerControl":[{"PowerConsumedWatts":null,"PowerMetrics":{"CurConsumedWatts":4920,"AverageConsumedWatts":4925}}]}),
+            ),
+            (
+                "/redfish/v1/Chassis/BMC_0/Thermal",
+                json!({ "Temperatures": [
+                    { "ReadingCelsius": 39.5 },
+                    { "ReadingCelsius": 71.0 }
+                ] }),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        for (route, body) in [(
+            "/redfish/v1/Systems/System_0/Storage/1/Drives/NVMe_0",
+            json!({ "CapacityBytes": 1_000_000, "Status": { "Health": "OK" } }),
+        )] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+
+        let client =
+            RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let telemetry = client.telemetry().await.unwrap();
+        assert_eq!(telemetry.system_uri, "/redfish/v1/Systems/System_0");
+        assert_eq!(telemetry.cpu.packages, 2);
+        assert_eq!(telemetry.cpu.cores, Some(128));
+        assert_eq!(telemetry.memory.modules, 1);
+        assert_eq!(telemetry.memory.capacity_mib, Some(98_304));
+        assert_eq!(telemetry.storage.drives, 1);
+        assert_eq!(telemetry.storage.capacity_bytes, Some(1_000_000));
+        assert_eq!(telemetry.power_watts, Some(4920.0));
+        assert_eq!(telemetry.temperature_celsius, Some(71.0));
     }
 
     async fn mock_discovery(server: &MockServer, password_change_required: bool, action: bool) {
