@@ -73,10 +73,20 @@ impl RedfishClient {
         lock
     }
 
+    #[cfg(test)]
     pub(super) async fn hardware_identity(
         &self,
         system: &Value,
         model_hint: Option<&str>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        self.hardware_identity_with_policy(system, model_hint, true).await
+    }
+
+    pub(super) async fn hardware_identity_with_policy(
+        &self,
+        system: &Value,
+        model_hint: Option<&str>,
+        allow_web_session: bool,
     ) -> (Option<String>, Option<String>, Option<String>) {
         let mut model = text(system, "Model").or_else(|| {
             model_hint
@@ -94,7 +104,7 @@ impl RedfishClient {
         }
         // This is an AMI web API fallback, NOT a standard Redfish resource. Never use it
         // on arbitrary vendors or invoke the existing first-login password-change flow.
-        if model.is_none()
+        if allow_web_session && model.is_none()
             && text(system, "Manufacturer").is_some_and(|m| m.eq_ignore_ascii_case("ASRockRack"))
             && let Some(fru) = self.ami_fru().await
         {

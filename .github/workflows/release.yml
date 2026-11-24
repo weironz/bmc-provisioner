@@ -53,9 +53,10 @@ jobs:
           cd ui && bun install --frozen-lockfile && bun run build
           cd .. && cargo build --release --locked --bin bmc-provisionerd
           v="${GITHUB_REF_NAME#v}"
-          mkdir -p out/cli out/compose
+          mkdir -p out/cli/ui out/compose
           cp target/release/bmc-provisionerd out/cli/
-          tar -czf "out/bmc-provisioner-$v-x86_64-linux.tar.gz" -C out/cli bmc-provisionerd
+          cp -a ui/dist out/cli/ui/dist
+          tar -czf "out/bmc-provisioner-$v-x86_64-linux.tar.gz" -C out/cli bmc-provisionerd ui
           cp compose.yaml .env.example README.md out/compose/
           tar -czf "out/bmc-provisioner-compose-$v.tar.gz" -C out/compose compose.yaml .env.example README.md
       - uses: actions/upload-artifact@v4
@@ -172,7 +173,7 @@ jobs:
 
             - Windows：下载 `*-setup.exe` 安装桌面端；
               桌面端左上角版本号可检查、下载并验证签名后安装后续更新；
-            - Linux：下载 `*-x86_64-linux.tar.gz`；
+            - Linux：下载 `*-x86_64-linux.tar.gz`，解压后从解压目录运行 `./bmc-provisionerd`；
             - IDC 双服务部署：下载 `*-compose-*.tar.gz`，解压后按 README 启动。
 
             Docker 镜像：`ghcr.io/${{ github.repository }}:${{ github.ref_name }}`。

@@ -251,6 +251,9 @@ body:has(.bmc-create-dialog[open]) { overflow:hidden; }
 .trend-chart svg polyline { fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-width: 5; vector-effect: non-scaling-stroke; }
 .trend-chart.power svg polyline { stroke: #75ac29; }
 .trend-chart.temperature svg polyline { stroke: #d8892c; }
+.trend-chart.power .trend-point { fill: #75ac29; }
+.trend-chart.temperature .trend-point { fill: #d8892c; }
+.telemetry-status { margin: 14px 0; padding: 10px 14px; background: #fff7e9; color: #74501b; border-left: 3px solid #d69a43; font-size: .83rem; }
 .trend-time-axis { color: #839086; display: flex; font-size: .65rem; justify-content: space-between; margin-top: 5px; }
 .trend-time-axis span:last-child { text-align: right; }
 .trend-empty { align-self: center; color: #77857c; font-size: .78rem; line-height: 1.55; margin: 20px 0; }

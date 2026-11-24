@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { capacity, reading, present, healthLabel, type GpuTelemetry, type GpuCard } from './telemetry';
-  let { data }: { data: GpuTelemetry } = $props();
+  import { capacity, reading, present, healthLabel, type GpuTelemetry, type GpuCard, type GpuEccChange } from './telemetry';
+  let { data, collectedAt, stale = false }: { data: GpuTelemetry; collectedAt?:number; stale?:boolean } = $props();
   const uid = $props.id();
   let expanded = $state<Set<number>>(new Set());
   function toggle(index: number) {
@@ -8,7 +8,16 @@
     if (next.has(index)) next.delete(index); else next.add(index);
     expanded = next;
   }
-  function hasEccError(card: GpuCard) { return present(card.uncorrectableEccErrors) && card.uncorrectableEccErrors > 0; }
+  function newUncorrectable(card: GpuCard) {
+    if (stale || collectedAt == null) return 0;
+    const change = card.eccHistory?.find(item => item.counter === 'uncorrectable' && item.collectedAt === collectedAt);
+    return change && present(change.previous) ? Math.max(0, change.count - change.previous) : 0;
+  }
+  function changeText(change: GpuEccChange) {
+    if (!present(change.previous)) return '初始读数 ' + reading(change.count, '', 0);
+    if (change.count < change.previous) return `计数回落 ${reading(change.previous, '', 0)} → ${reading(change.count, '', 0)}`;
+    return `新增 ${reading(change.count - change.previous, '', 0)} · 累计 ${reading(change.count, '', 0)}`;
+  }
 </script>
 
 {#if data.discovery !== 'absent'}
@@ -28,7 +37,14 @@
             {#each data.cards as card, i}
               <tr class="gpu-row" class:expanded={expanded.has(i)}>
                 <th scope="row" class="identity"><strong>{card.id}</strong><small title={card.model || '型号未提供'}>{card.model || '型号未提供'}</small></th>
-                <td class="state" data-label="状态"><span class="health" class:warning={card.health === 'Warning' || card.health === 'Critical' || hasEccError(card)}>{healthLabel(card.state)} · {hasEccError(card) ? 'ECC 累计异常' : healthLabel(card.health)}</span>{#if card.warnings.length}<small class="partial">部分指标缺失</small>{/if}</td>
+                <td class="state" data-label="状态">
+                  <span class="health" class:warning={card.health === 'Warning'} class:critical={card.health === 'Critical'}>{healthLabel(card.state)} · {healthLabel(card.health)}</span>
+                  {#if present(card.uncorrectableEccErrors) && card.uncorrectableEccErrors > 0}
+                    <small class="ecc-count">累计不可纠正 ECC {reading(card.uncorrectableEccErrors, '', 0)}</small>
+                  {/if}
+                  {#if newUncorrectable(card) > 0}<small class="ecc-increase">本次新增 {reading(newUncorrectable(card), '', 0)}</small>{/if}
+                  {#if card.warnings.length}<small class="partial">部分指标缺失</small>{/if}
+                </td>
                 <td class="capacity" data-label="显存容量">{capacity(card.memoryCapacityMib)}</td>
                 <td class="temperature" data-label="温度">{reading(card.temperatureCelsius, '°C')}</td>
                 <td class="power" data-label="功率">{reading(card.powerWatts, 'W')}</td>
@@ -41,10 +57,21 @@
                   <div><dt>显存带宽利用率</dt><dd>{reading(card.memoryBandwidthPercent, '%')}</dd></div>
                   <div><dt>功率上限</dt><dd>{reading(card.powerLimitWatts, 'W')}</dd></div>
                   <div><dt>可纠正 ECC（累计）</dt><dd>{reading(card.correctableEccErrors, '', 0)}</dd></div>
-                  <div><dt>不可纠正 ECC（累计）</dt><dd class:abnormal={hasEccError(card)}>{reading(card.uncorrectableEccErrors, '', 0)}</dd></div>
+                  <div><dt>不可纠正 ECC（累计）</dt><dd>{reading(card.uncorrectableEccErrors, '', 0)}</dd></div>
                   <div><dt>可纠正行重映射</dt><dd>{reading(card.correctableRowRemaps, '', 0)}</dd></div>
                   <div><dt>不可纠正行重映射</dt><dd>{reading(card.uncorrectableRowRemaps, '', 0)}</dd></div>
                 </dl>
+                {#if card.eccHistory?.length}
+                  <div class="ecc-history">
+                    <strong>ECC 变化记录</strong>
+                    <ul>
+                      {#each card.eccHistory as change}
+                        <li><time datetime={new Date(change.collectedAt * 1000).toISOString()}>{new Date(change.collectedAt * 1000).toLocaleString('zh-CN',{hour12:false})}</time>
+                          <span>{change.counter === 'uncorrectable' ? '不可纠正' : '可纠正'} · {changeText(change)}</span></li>
+                      {/each}
+                    </ul>
+                  </div>
+                {/if}
                 {#each card.warnings as warning}<p class="notice">{warning}</p>{/each}
               </td></tr>
             {/each}
@@ -67,7 +94,13 @@
   thead th { background:#f1f5ec; color:#60715f; font-size:.71rem; font-weight:600; padding-block:10px; }
   thead th:first-child { width:19%; } thead th:nth-child(2) { width:16%; } thead th:nth-child(6) { width:13%; } thead th:nth-child(7) { width:12%; } thead th:last-child { width:64px; }
   .identity strong { font-size:.83rem; } small { display:block; font-size:.69rem; line-height:1.5; margin-top:3px; color:#7b887b; font-weight:400; } .identity small { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .gpu-row:hover,.gpu-row.expanded { background:#f7f9f3; } .health { color:#536e30; font-size:.73rem; } .health.warning,.partial,.abnormal { color:#a26718; }
+  .gpu-row:hover,.gpu-row.expanded { background:#f7f9f3; } .health { color:#536e30; font-size:.73rem; } .health.warning,.partial { color:#8a5716; }
+  .health.critical,.ecc-increase { color:#a53626; font-weight:600; }
+  .ecc-count { color:#65745f; }
+  .ecc-history { font-size:.76rem; margin-top:12px; color:#556651; }
+  .ecc-history ul { list-style:none; padding:0; margin:6px 0 0; }
+  .ecc-history li { display:flex; flex-wrap:wrap; gap:4px 12px; padding:3px 0; }
+  .ecc-history time { font-variant-numeric:tabular-nums; color:#68765f; }
   meter { display:block; width:100%; max-width:86px; height:4px; margin-top:5px; appearance:none; border:0; background:#edf1e9; } meter::-webkit-meter-bar { border:0; background:#edf1e9; } meter::-webkit-meter-optimum-value { background:#8abc32; }
   .action { padding:4px; } button { border:0; background:transparent; color:#587d22; font-size:.75rem; min-height:40px; min-width:52px; padding:6px; cursor:pointer; } button:hover { background:#eaf0e1; } button:focus-visible { outline:2px solid #8cc63f; outline-offset:1px; }
   .detail-row[hidden] { display:none; } .detail-row>td { background:#f6f8f2; padding:14px 16px; }

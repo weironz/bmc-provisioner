@@ -80,6 +80,7 @@ pub enum PowerAction {
 pub struct PowerStatus {
     pub system_uri: String,
     pub power_state: Option<String>,
+    pub last_reset_time: Option<String>,
     pub supported_actions: Vec<PowerAction>,
 }
 
@@ -331,6 +332,13 @@ impl RedfishClient {
     }
 
     pub async fn discover(&self) -> Result<RedfishInventory, RedfishError> {
+        self.discover_resources().await.map_err(|error| match error {
+            RedfishError::ResourceAccess { .. } => RedfishError::AuthenticationFailed,
+            error => error,
+        })
+    }
+
+    async fn discover_resources(&self) -> Result<RedfishInventory, RedfishError> {
         let root: ServiceRoot = self.get_json("/redfish/v1/").await?;
         let account_service: AccountService = self.get_json(&root.account_service.odata_id).await?;
         let account_collection: Collection =
@@ -408,6 +416,7 @@ impl RedfishClient {
         Ok(PowerStatus {
             system_uri: system.uri,
             power_state: system.power_state,
+            last_reset_time: system.last_reset_time,
             supported_actions: supported_power_actions(&system.allowable_reset_types),
         })
     }
@@ -426,7 +435,18 @@ impl RedfishClient {
             &target,
             json!({ "ResetType": reset_type }),
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            RedfishError::AuthenticationFailed => RedfishError::ResourceAccess {
+                status: StatusCode::UNAUTHORIZED,
+                path: self.resource_url(&target).map(|url| url.path().to_owned()).unwrap_or_default(),
+            },
+            RedfishError::UnexpectedStatus { status: StatusCode::FORBIDDEN, .. } => RedfishError::ResourceAccess {
+                status: StatusCode::FORBIDDEN,
+                path: self.resource_url(&target).map(|url| url.path().to_owned()).unwrap_or_default(),
+            },
+            error => error,
+        })?;
         Ok(PowerCommandResult {
             system_uri: system.uri,
             requested_action: action,
@@ -445,7 +465,23 @@ impl RedfishClient {
         &self,
         model_hint: Option<&str>,
     ) -> Result<TelemetrySnapshot, RedfishError> {
-        let root: ServiceRoot = self.get_json("/redfish/v1/").await?;
+        self.collect_telemetry(model_hint, true).await
+    }
+
+    /// Background monitoring uses only Redfish GET requests.
+    pub async fn read_only_telemetry(
+        &self,
+        model_hint: Option<&str>,
+    ) -> Result<TelemetrySnapshot, RedfishError> {
+        self.collect_telemetry(model_hint, false).await
+    }
+
+    async fn collect_telemetry(
+        &self,
+        model_hint: Option<&str>,
+        allow_web_session: bool,
+    ) -> Result<TelemetrySnapshot, RedfishError> {
+        let root: MonitoringRoot = self.get_json("/redfish/v1/").await?;
         let systems = root.systems.ok_or(RedfishError::NoComputerSystem)?;
         let systems: Collection = self.get_json(&systems.odata_id).await?;
         let b300_layout = systems
@@ -456,7 +492,9 @@ impl RedfishClient {
         let resource: Value = self.get_json(&system.odata_id).await?;
 
         // Collect core identity and whole-server readings before optional drive/GPU walks.
-        let (model, serial_number, bmc_mac) = self.hardware_identity(&resource, model_hint).await;
+        let (model, serial_number, bmc_mac) = self
+            .hardware_identity_with_policy(&resource, model_hint, allow_web_session)
+            .await;
         let (power_watts, temperature_celsius, mut hardware) = if b300_layout {
             self.b300_environment().await
         } else {
@@ -576,7 +614,7 @@ impl RedfishClient {
     }
 
     async fn power_system(&self) -> Result<PowerSystem, RedfishError> {
-        let root: ServiceRoot = self.get_json("/redfish/v1/").await?;
+        let root: MonitoringRoot = self.get_json("/redfish/v1/").await?;
         let systems = root.systems.ok_or(RedfishError::NoComputerSystem)?;
         let systems: Collection = self.get_json(&systems.odata_id).await?;
         let system = selected_system(&systems)?;
@@ -620,6 +658,7 @@ impl RedfishClient {
         Ok(PowerSystem {
             uri: system.odata_id.clone(),
             power_state: response.power_state,
+            last_reset_time: response.last_reset_time,
             reset_target: reset.as_ref().map(|action| action.target.clone()),
             allowable_reset_types: allowable_types,
         })
@@ -936,6 +975,7 @@ impl RedfishClient {
         let read_lock = self.read_lock();
         let _guard = read_lock.lock().await;
         let url = self.resource_url(resource)?;
+        let path = url.path().to_owned();
         tracing::debug!(resource, "reading Redfish resource");
         let response = self
             .client
@@ -944,6 +984,9 @@ impl RedfishClient {
             .send()
             .await
             .map_err(RedfishError::Request)?;
+        if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(RedfishError::ResourceAccess { status: response.status(), path });
+        }
         let response = ensure_success(response).await?;
         response.json().await.map_err(RedfishError::Decode)
     }
@@ -1346,7 +1389,7 @@ async fn ensure_success(response: Response) -> Result<Response, RedfishError> {
     let status = response.status();
     if status.is_success() {
         Ok(response)
-    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+    } else if status == StatusCode::UNAUTHORIZED {
         Err(RedfishError::AuthenticationFailed)
     } else {
         // Redfish standard errors contain stable MessageId values such as
@@ -1406,6 +1449,8 @@ pub enum RedfishError {
     Request(#[source] reqwest::Error),
     #[error("BMC authentication failed")]
     AuthenticationFailed,
+    #[error("Redfish returned HTTP {status} for {path}")]
+    ResourceAccess { status: StatusCode, path: String },
     #[error("this BMC does not expose the supported AMI first-login password API")]
     AmiWebBootstrapUnsupported,
     #[error("BMC rejected the AMI first-login password change")]
@@ -1455,6 +1500,10 @@ struct ServiceRoot {
     account_service: Link,
     #[serde(rename = "Managers")]
     managers: Link,
+}
+
+#[derive(Deserialize)]
+struct MonitoringRoot {
     #[serde(rename = "Systems", default)]
     systems: Option<Link>,
     #[serde(rename = "Chassis", default)]
@@ -1613,6 +1662,7 @@ struct Manager {
 struct PowerSystem {
     uri: String,
     power_state: Option<String>,
+    last_reset_time: Option<String>,
     reset_target: Option<String>,
     allowable_reset_types: Vec<String>,
 }
@@ -1621,6 +1671,8 @@ struct PowerSystem {
 struct ComputerSystem {
     #[serde(rename = "PowerState")]
     power_state: Option<String>,
+    #[serde(rename = "LastResetTime")]
+    last_reset_time: Option<String>,
     #[serde(rename = "Actions", default)]
     actions: Value,
 }
@@ -1778,6 +1830,47 @@ mod tests {
             current_password: "not-in-output".to_owned(),
             new_password: "another-secret".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn monitoring_distinguishes_authentication_and_permission_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/redfish/v1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Systems":{"@odata.id":"/systems"}})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/systems"))
+            .respond_with(ResponseTemplate::new(403)).expect(2).mount(&server).await;
+        Mock::given(method("GET")).and(path("/locked"))
+            .respond_with(ResponseTemplate::new(401)).expect(1).mount(&server).await;
+        let client = RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        assert!(matches!(client.get_json::<Value>("/locked?ignored=true").await,
+            Err(RedfishError::ResourceAccess { status: StatusCode::UNAUTHORIZED, path }) if path == "/locked"));
+        assert!(matches!(client.power_status().await,
+            Err(RedfishError::ResourceAccess { status: StatusCode::FORBIDDEN, path }) if path == "/systems"));
+        assert!(matches!(client.read_only_telemetry(None).await,
+            Err(RedfishError::ResourceAccess { status: StatusCode::FORBIDDEN, path }) if path == "/systems"));
+    }
+
+    #[tokio::test]
+    async fn background_identity_reads_do_not_open_vendor_web_sessions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/redfish/v1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Systems":{"@odata.id":"/systems"}})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Members":[{"@odata.id":"/host"}]})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/host"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Manufacturer":"ASRockRack","SerialNumber":"test-sn"})))
+            .mount(&server).await;
+        for verb in ["POST", "PATCH", "PUT", "DELETE"] {
+            Mock::given(method(verb)).respond_with(ResponseTemplate::new(400)).expect(0).mount(&server).await;
+        }
+        let client = RedfishClient::new_for_mock(Url::parse(&server.uri()).unwrap(), &credentials());
+        let result = client.read_only_telemetry(Some("saved-model")).await.unwrap();
+        assert_eq!(result.serial_number.as_deref(), Some("test-sn"));
+        assert_eq!(result.model.as_deref(), Some("saved-model"));
+        assert!(client.read_only_telemetry(None).await.unwrap().model.is_none());
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub struct GpuTelemetry {
 #[serde(rename_all = "camelCase")]
 pub struct GpuCard {
     pub id: String,
+    #[serde(skip)]
+    pub ecc_device_key: String,
     pub model: Option<String>,
     pub state: Option<String>,
     pub health: Option<String>,
@@ -31,6 +33,7 @@ pub struct GpuCard {
     pub uncorrectable_ecc_errors: Option<f64>,
     pub correctable_row_remaps: Option<f64>,
     pub uncorrectable_row_remaps: Option<f64>,
+    pub ecc_history: Vec<crate::storage::GpuEccChange>,
     pub warnings: Vec<String>,
 }
 
@@ -45,12 +48,8 @@ impl RedfishClient {
         .await
         {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(RedfishError::AuthenticationFailed)) => Err("认证失败或无读取权限"),
-            Ok(Err(RedfishError::UnexpectedStatus { status, .. }))
-                if status == StatusCode::FORBIDDEN =>
-            {
-                Err("无读取权限")
-            }
+            Ok(Err(RedfishError::ResourceAccess { status: StatusCode::UNAUTHORIZED, .. })) => Err("需要认证（HTTP 401）"),
+            Ok(Err(RedfishError::ResourceAccess { status: StatusCode::FORBIDDEN, .. })) => Err("无读取权限（HTTP 403）"),
             Ok(Err(RedfishError::UnexpectedStatus { status, .. }))
                 if status == StatusCode::NOT_FOUND =>
             {
@@ -220,6 +219,10 @@ impl RedfishClient {
             id: string_field(resource, "Id")
                 .unwrap_or_else(|| uri.rsplit('/').next().unwrap_or("GPU").into()),
             model: string_field(resource, "Model"),
+            ecc_device_key: format!("{uri}|{}", string_field(resource, "SerialNumber")
+                .or_else(|| string_field(resource, "UUID"))
+                .or_else(|| resource.pointer("/Oem/Nvidia/UUID").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default()),
             state: resource
                 .pointer("/Status/State")
                 .and_then(Value::as_str)
@@ -252,16 +255,17 @@ impl RedfishClient {
         };
         // Some BMC firmware rejects overlapping authenticated metric reads. Keep this pass
         // serial and bounded, even though the HTTP pool can support concurrent requests.
-        let environment = read(env).await;
-        let processor = read(proc).await;
-        let memory = read(mem).await;
-        for (label, value) in [
-            ("温度 / 功率", &environment),
-            ("GPU 利用率", &processor),
-            ("显存指标", &memory),
+        let environment = read(env.clone()).await;
+        let processor = read(proc.clone()).await;
+        let memory = read(mem.clone()).await;
+        for (label, value, path) in [
+            ("温度 / 功率", &environment, env),
+            ("GPU 利用率", &processor, proc),
+            ("显存指标", &memory, mem),
         ] {
             if let Err(error) = value {
-                card.warnings.push(format!("{label}：{error}"));
+                let path = path.as_deref().unwrap_or_default().split('?').next().unwrap_or_default();
+                card.warnings.push(format!("{label}：{error} · {path}"));
             }
         }
         if let Ok(Some(value)) = environment {

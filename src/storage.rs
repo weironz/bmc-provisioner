@@ -86,6 +86,15 @@ pub struct TelemetryHistoryPoint {
     pub temperature_celsius: Option<f64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuEccChange {
+    pub collected_at: i64,
+    pub counter: &'static str,
+    pub count: f64,
+    pub previous: Option<f64>,
+}
+
 /// Selects the retained telemetry precision used to answer a dashboard query.
 #[derive(Clone, Copy, Debug)]
 pub enum TelemetryHistoryResolution {
@@ -153,6 +162,7 @@ impl InventoryStore {
         connection
             .execute_batch(
                 "
+                PRAGMA foreign_keys = ON;
                 CREATE TABLE IF NOT EXISTS managed_bmcs (
                     identity TEXT PRIMARY KEY,
                     display_name TEXT NOT NULL DEFAULT '',
@@ -205,6 +215,17 @@ impl InventoryStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_bmc_telemetry_rollups_identity_time
                     ON bmc_telemetry_rollups (identity, resolution_seconds, window_start);
+                CREATE TABLE IF NOT EXISTS bmc_gpu_ecc_changes (
+                    id INTEGER PRIMARY KEY,
+                    identity TEXT NOT NULL REFERENCES managed_bmcs(identity) ON DELETE CASCADE,
+                    gpu_key TEXT NOT NULL,
+                    counter TEXT NOT NULL,
+                    collected_at INTEGER NOT NULL,
+                    count REAL NOT NULL,
+                    previous REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bmc_gpu_ecc_lookup
+                    ON bmc_gpu_ecc_changes (identity, gpu_key, counter, id DESC);
                 CREATE TABLE IF NOT EXISTS bmc_device_credentials (
                     identity TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -239,6 +260,14 @@ impl InventoryStore {
 
     pub fn save_defaults(&self, defaults: &ProvisionDefaults) -> Result<(), StoreError> {
         self.save_setting("provision_defaults", defaults)
+    }
+
+    pub fn monitoring_interval(&self) -> Result<u64, StoreError> {
+        Ok(self.load_setting("monitoring_interval_seconds")?.unwrap_or(30))
+    }
+
+    pub fn save_monitoring_interval(&self, seconds: u64) -> Result<(), StoreError> {
+        self.save_setting("monitoring_interval_seconds", &seconds)
     }
 
     fn load_setting<T: for<'de> Deserialize<'de>>(
@@ -481,8 +510,7 @@ impl InventoryStore {
         credential_profile: &str,
         result: Option<&ProvisionResult>,
         error: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let identity = identity(candidate);
+    ) -> Result<String, StoreError> {
         let now = timestamp();
         let (current_ip, configuration_status, online, redfish, authentication) = match result {
             Some(result) if matches!(result.status, ProvisionStatus::Completed) => (
@@ -502,6 +530,7 @@ impl InventoryStore {
             None => (candidate.ip, "failed", "unknown", "unknown", "unknown"),
         };
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let identity = provisioning_identity(&connection, candidate)?;
         connection
             .execute(
                 "INSERT INTO managed_bmcs (
@@ -527,7 +556,7 @@ impl InventoryStore {
                 ],
             )
             .map_err(StoreError::Database)?;
-        Ok(())
+        Ok(identity)
     }
 
     /// Adopt an already-static controller after an authenticated, read-only Redfish check.
@@ -539,9 +568,9 @@ impl InventoryStore {
         fingerprint: Option<&str>,
         credential_profile: &str,
     ) -> Result<ManagedBmc, StoreError> {
-        let identity = identity(candidate);
         let now = timestamp();
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let identity = provisioning_identity(&connection, candidate)?;
         connection.execute(
             "INSERT INTO managed_bmcs (
                 identity, mac, scope_id, scope_name, credential_profile, source_ip, current_ip, target_ip,
@@ -647,6 +676,55 @@ impl InventoryStore {
         Ok(())
     }
 
+    /// Unchanged readings are represented by the previous observation. Keep the last
+    /// observations for each counter, including the baseline and any decreases.
+    pub fn record_gpu_ecc(
+        &self,
+        identity: &str,
+        gpu_key: &str,
+        collected_at: i64,
+        correctable: Option<f64>,
+        uncorrectable: Option<f64>,
+    ) -> Result<Vec<GpuEccChange>, StoreError> {
+        let mut connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let transaction = connection.transaction().map_err(StoreError::Database)?;
+        let mut changes = Vec::new();
+        for (counter, reading) in [("correctable", correctable), ("uncorrectable", uncorrectable)] {
+            let entries = || {
+                let mut query = transaction.prepare(
+                    "SELECT collected_at, count, previous FROM bmc_gpu_ecc_changes
+                     WHERE identity=?1 AND gpu_key=?2 AND counter=?3 ORDER BY id DESC LIMIT 8",
+                )?;
+                query.query_map(params![identity, gpu_key, counter], |row| {
+                    Ok(GpuEccChange { collected_at: row.get(0)?, counter, count: row.get(1)?, previous: row.get(2)? })
+                })?.collect::<Result<Vec<_>, _>>()
+            };
+            let mut history = entries().map_err(StoreError::Database)?;
+            let previous = history.first().map(|entry| entry.count);
+            if let Some(count) = reading.filter(|reading| Some(*reading) != previous) {
+                transaction.execute(
+                    "INSERT INTO bmc_gpu_ecc_changes (identity,gpu_key,counter,collected_at,count,previous)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![identity,gpu_key,counter,collected_at,count,previous],
+                ).map_err(StoreError::Database)?;
+                transaction.execute(
+                    "DELETE FROM bmc_gpu_ecc_changes
+                     WHERE identity=?1 AND gpu_key=?2 AND counter=?3 AND id NOT IN (
+                        SELECT id FROM bmc_gpu_ecc_changes WHERE identity=?1 AND gpu_key=?2 AND counter=?3
+                        ORDER BY id DESC LIMIT 8
+                     )",
+                    params![identity,gpu_key,counter],
+                ).map_err(StoreError::Database)?;
+                history.insert(0, GpuEccChange { collected_at, counter, count, previous });
+                history.truncate(8);
+            }
+            changes.extend(history);
+        }
+        transaction.commit().map_err(StoreError::Database)?;
+        changes.sort_by_key(|entry| std::cmp::Reverse(entry.collected_at));
+        Ok(changes)
+    }
+
     /// Returns locally retained telemetry at an appropriate source precision. SQLite performs
     /// the final averaging so long dashboard ranges remain responsive.
     pub fn telemetry_history(
@@ -719,17 +797,19 @@ impl InventoryStore {
         }
         let (nonce, ciphertext) = encrypt_device_password(password, key)?;
         let now = timestamp();
-        let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
-        let changed = connection
+        let mut connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let transaction = connection.transaction().map_err(StoreError::Database)?;
+        let changed = transaction
             .execute(
-                "UPDATE managed_bmcs SET credential_profile='' WHERE identity=?1",
+                "UPDATE managed_bmcs SET credential_profile='', authentication_status='unknown',
+                        last_checked_at=NULL, last_error=NULL WHERE identity=?1",
                 [identity],
             )
             .map_err(StoreError::Database)?;
         if changed == 0 {
             return Err(StoreError::MissingRecord);
         }
-        connection
+        transaction
             .execute(
                 "INSERT INTO bmc_device_credentials (
                     identity, username, secret_nonce, secret_ciphertext, key_version, updated_at
@@ -739,10 +819,11 @@ impl InventoryStore {
                     secret_nonce=excluded.secret_nonce,
                     secret_ciphertext=excluded.secret_ciphertext,
                     key_version=excluded.key_version,
-                    updated_at=excluded.updated_at",
+                    updated_at=MAX(bmc_device_credentials.updated_at+1, excluded.updated_at)",
                 params![identity, username, nonce, ciphertext, now],
             )
             .map_err(StoreError::Database)?;
+        transaction.commit().map_err(StoreError::Database)?;
         drop(connection);
         self.find(identity)?.ok_or(StoreError::MissingRecord)
     }
@@ -823,11 +904,11 @@ impl InventoryStore {
         scope_name: Option<&str>,
         display_name: Option<&str>,
     ) -> Result<ManagedBmc, StoreError> {
-        let identity = mac
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("manual-{current_ip}"));
+        let identity = format!("manual-{}", Uuid::new_v4());
+        let mac = mac.map(str::trim).filter(|value| !value.is_empty());
         let now = timestamp();
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        check_inventory_conflict(&connection, &identity, current_ip, mac, false)?;
         connection
             .execute(
                 "INSERT INTO managed_bmcs (
@@ -836,9 +917,7 @@ impl InventoryStore {
                     online_status, redfish_status, authentication_status, last_checked_at,
                     last_configured_at, last_error
                 ) VALUES (?1, ?2, ?3, 0, ?4, '', ?5, ?5, ?5, 24, '0.0.0.0', NULL, 'manual',
-                          'unknown', 'unknown', 'unknown', NULL, ?6, NULL)
-                ON CONFLICT(identity) DO UPDATE SET
-                    display_name=excluded.display_name, mac=excluded.mac, scope_name=excluded.scope_name, current_ip=excluded.current_ip",
+                          'unknown', 'unknown', 'unknown', NULL, ?6, NULL)",
                 params![identity, display_name.unwrap_or(""), mac, scope_name.unwrap_or("手动添加"), current_ip.to_string(), now],
             )
             .map_err(StoreError::Database)?;
@@ -894,17 +973,29 @@ impl InventoryStore {
         current_ip: Ipv4Addr,
     ) -> Result<ManagedBmc, StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Lock)?;
+        let Some((address, is_draft)) = connection.query_row(
+            "SELECT current_ip, configuration_status='draft' FROM managed_bmcs WHERE identity=?1",
+            [identity], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        ).optional().map_err(StoreError::Database)? else {
+            return Err(StoreError::MissingRecord);
+        };
+        if !is_draft && address == current_ip.to_string() {
+            drop(connection);
+            return self.find(identity)?.ok_or(StoreError::MissingRecord);
+        }
+        check_inventory_conflict(&connection, identity, current_ip, None, true)?;
         let changed = connection
             .execute(
                 "UPDATE managed_bmcs SET current_ip=?2,
                  bmc_mac=CASE WHEN current_ip=?2 THEN bmc_mac ELSE NULL END,
                  serial_number=CASE WHEN current_ip=?2 THEN serial_number ELSE NULL END,
                  hardware_model=CASE WHEN current_ip=?2 THEN hardware_model ELSE NULL END,
+                 certificate_fingerprint=CASE WHEN current_ip=?2 THEN certificate_fingerprint ELSE NULL END,
                  source_ip=CASE WHEN configuration_status='draft' THEN ?2 ELSE source_ip END,
                  target_ip=CASE WHEN configuration_status='draft' THEN ?2 ELSE target_ip END,
                  configuration_status=CASE WHEN configuration_status='draft' THEN 'manual' ELSE configuration_status END,
                  online_status='unknown', redfish_status='unknown', authentication_status='unknown', last_checked_at=NULL,
-                 last_error=CASE WHEN configuration_status='draft' THEN NULL ELSE last_error END
+                 last_error=NULL
                  WHERE identity=?1",
                 params![identity, current_ip.to_string()],
             )
@@ -971,6 +1062,27 @@ impl InventoryStore {
         }
         Ok(())
     }
+}
+
+fn check_inventory_conflict(
+    connection: &Connection,
+    identity: &str,
+    ip: Ipv4Addr,
+    mac: Option<&str>,
+    ignore_drafts: bool,
+) -> Result<(), StoreError> {
+    let conflict = connection.query_row(
+        "SELECT b.identity, b.display_name, b.current_ip, c.name
+         FROM managed_bmcs b LEFT JOIN bmc_clusters c ON b.cluster_id=c.id
+         WHERE b.identity<>?1 AND (NOT ?4 OR b.configuration_status<>'draft')
+         AND (b.current_ip=?2 OR lower(b.mac)=lower(?3) OR lower(b.bmc_mac)=lower(?3))
+         ORDER BY b.configuration_status='draft', b.identity LIMIT 1",
+        params![identity, ip.to_string(), mac, ignore_drafts],
+        |row| Ok(StoreError::DeviceConflict {
+            identity: row.get(0)?, name: row.get(1)?, address: row.get(2)?, cluster: row.get(3)?,
+        }),
+    ).optional().map_err(StoreError::Database)?;
+    conflict.map_or(Ok(()), Err)
 }
 
 fn row_to_managed_bmc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedBmc> {
@@ -1051,6 +1163,17 @@ fn identity(candidate: &BmcCandidate) -> String {
         .mac
         .clone()
         .unwrap_or_else(|| format!("scope-{}-ip-{}", candidate.scope_id, candidate.ip))
+}
+
+fn provisioning_identity(connection: &Connection, candidate: &BmcCandidate) -> Result<String, StoreError> {
+    let fallback = identity(candidate);
+    let Some(mac) = candidate.mac.as_deref() else { return Ok(fallback); };
+    Ok(connection.query_row(
+        "SELECT identity FROM managed_bmcs WHERE lower(mac)=lower(?1)
+         ORDER BY identity=?2 DESC, identity LIMIT 1",
+        params![mac, fallback],
+        |row| row.get(0),
+    ).optional().map_err(StoreError::Database)?.unwrap_or(fallback))
 }
 
 fn ensure_managed_bmc_column(
@@ -1193,6 +1316,8 @@ pub enum StoreError {
     NoDataDirectory,
     #[error("managed BMC record was not found")]
     MissingRecord,
+    #[error("a BMC with this address or MAC is already in the inventory")]
+    DeviceConflict { identity: String, name: String, address: String, cluster: Option<String> },
     #[error("could not encode provisioning defaults")]
     SettingsEncode(#[source] serde_json::Error),
     #[error("stored provisioning defaults are invalid")]
@@ -1287,6 +1412,50 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         drop(store);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reused_address_creates_a_new_identity_and_duplicate_save_preserves_both_rows() {
+        let store = InventoryStore::open(Path::new(":memory:")).unwrap();
+        let first_ip = Ipv4Addr::new(192, 0, 2, 10);
+        let moved_ip = Ipv4Addr::new(192, 0, 2, 11);
+        let original = store.add_manual(first_ip, None, None, Some("original")).unwrap();
+        // Simulate a database row created by versions that used its first address as its ID.
+        let legacy_id = format!("manual-{first_ip}");
+        store.connection.lock().unwrap().execute(
+            "UPDATE managed_bmcs SET identity=?1 WHERE identity=?2",
+            params![legacy_id, original.identity],
+        ).unwrap();
+        store.update_address(&legacy_id, moved_ip).unwrap();
+        let new_device = store.add_manual(first_ip, None, None, Some("replacement")).unwrap();
+        assert_ne!(legacy_id, new_device.identity);
+        let original = store.find(&legacy_id).unwrap().unwrap();
+        assert_eq!(original.current_ip, moved_ip);
+        assert_eq!(original.display_name, "original");
+        assert!(matches!(
+            store.add_manual(first_ip, None, None, Some("overwrite")),
+            Err(StoreError::DeviceConflict { identity, name, .. })
+                if identity == new_device.identity && name == "replacement"
+        ));
+        let copy = store.duplicate(&new_device.identity).unwrap();
+        assert!(matches!(store.update_address(&copy.identity, first_ip), Err(StoreError::DeviceConflict { .. })));
+        assert_eq!(store.find(&copy.identity).unwrap().unwrap().configuration_status, "draft");
+    }
+
+    #[test]
+    fn gpu_ecc_history_records_baselines_growth_and_counter_decreases() {
+        let store = InventoryStore::open(Path::new(":memory:")).unwrap();
+        let device = store.add_manual(Ipv4Addr::LOCALHOST, None, None, None).unwrap();
+        let record = |time, value| store.record_gpu_ecc(&device.identity, "GPU_0|serial", time, None, value).unwrap();
+        assert!(record(1, None).is_empty());
+        let baseline = record(2, Some(9.0));
+        assert_eq!(baseline[0].previous, None);
+        assert_eq!(record(3, Some(9.0)), baseline);
+        assert_eq!(record(4, None), baseline);
+        let increase = record(5, Some(10.0));
+        assert_eq!((increase[0].collected_at, increase[0].count, increase[0].previous), (5, 10.0, Some(9.0)));
+        assert_eq!(record(6, Some(0.0))[0].previous, Some(10.0));
+        assert_eq!(record(7, Some(1.0))[0].previous, Some(0.0));
     }
 
     #[test]

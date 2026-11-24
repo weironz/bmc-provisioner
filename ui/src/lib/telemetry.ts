@@ -1,9 +1,11 @@
+export type GpuEccChange = { collectedAt:number; counter:'correctable'|'uncorrectable'; count:number; previous?:number|null };
 export type GpuCard = {
   id: string; model?: string; state?: string; health?: string;
   memoryCapacityMib?: number; memoryUtilizationPercent?: number; memoryBandwidthPercent?: number;
   utilizationPercent?: number; temperatureCelsius?: number; powerWatts?: number; powerLimitWatts?: number;
   correctableEccErrors?: number; uncorrectableEccErrors?: number;
   correctableRowRemaps?: number; uncorrectableRowRemaps?: number; warnings: string[];
+  eccHistory?: GpuEccChange[];
 };
 export type GpuTelemetry = {
   discovery: 'available'|'absent'|'unknown'|'partial'; availableCount?: number;

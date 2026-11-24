@@ -37,11 +37,15 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
 
+mod monitoring;
+
 struct AppState {
     plans: Mutex<HashMap<Uuid, PlannedRecord>>,
     jobs: Mutex<HashMap<Uuid, JobRecord>>,
     provisioning_queue: Arc<ProvisioningQueue>,
     inventory: InventoryStore,
+    monitoring: monitoring::Monitoring,
+    inventory_edit: Mutex<()>,
     device_credential_key: DeviceCredentialKey,
     /// Docker often has neither Windows Credential Manager nor Linux Secret
     /// Service.  When explicitly enabled, profile secrets stay in this process
@@ -317,32 +321,23 @@ struct BatchClusterAssignmentResponse {
 }
 
 #[derive(Deserialize)]
-struct ManagedPowerStatusRequest {}
+#[serde(rename_all = "camelCase")]
+struct ManagedPowerStatusRequest {
+    expected_ip: Option<Ipv4Addr>,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagedPowerRequest {
     action: PowerAction,
+    expected_ip: Option<Ipv4Addr>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagedPowerStatusResponse {
     managed: ManagedBmc,
     power: Option<PowerStatus>,
-    certificate_fingerprint: Option<CertificateFingerprint>,
-    certificate_trust_required: bool,
-    detail: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ManagedTelemetryRequest {}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManagedTelemetryResponse {
-    managed: ManagedBmc,
-    telemetry: Option<TelemetrySnapshot>,
     certificate_fingerprint: Option<CertificateFingerprint>,
     certificate_trust_required: bool,
     detail: Option<String>,
@@ -459,12 +454,15 @@ async fn main() {
         jobs: Mutex::new(HashMap::new()),
         provisioning_queue: Arc::new(ProvisioningQueue::new(defaults.batch_concurrency)),
         inventory,
+        monitoring: monitoring::Monitoring::default(),
+        inventory_edit: Mutex::new(()),
         device_credential_key,
         session_credentials: std::env::var("BMC_PROVISIONER_SESSION_CREDENTIALS")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")),
         session_profile_secrets: Mutex::new(HashMap::new()),
     });
     migrate_legacy_managed_credentials(&state).await;
+    let monitoring_state = state.clone();
     let ui_directory =
         std::env::var("BMC_PROVISIONER_UI_DIR").unwrap_or_else(|_| "ui/dist".to_owned());
     let index = format!("{ui_directory}/index.html");
@@ -519,8 +517,10 @@ async fn main() {
         )
         .route(
             "/api/v1/managed-bmcs/{identity}/telemetry",
-            post(managed_telemetry),
+            get(monitoring::cached_telemetry).post(monitoring::cached_telemetry),
         )
+        .route("/api/v1/monitoring/status", get(monitoring::cached_status))
+        .route("/api/v1/settings/monitoring", get(monitoring::load_settings).put(monitoring::save_settings))
         .route(
             "/api/v1/managed-bmcs/{identity}/telemetry/history",
             get(managed_telemetry_history),
@@ -562,6 +562,7 @@ async fn main() {
         .await
         .expect("bind local HTTP server");
     tracing::info!(%address, "bmc-provisionerd listening");
+    tokio::spawn(monitoring::run(monitoring_state));
     axum::serve(listener, app)
         .await
         .expect("serve local HTTP server");
@@ -923,23 +924,22 @@ async fn run_job(
             } else {
                 credential_profile.clone()
             };
-            if let Err(error) = state.inventory.record_provision(
+            let stored = state.inventory.record_provision(
                 &candidate,
                 &target_network,
                 fingerprint.as_deref(),
                 &effective_profile,
                 Some(&result),
                 None,
-            ) {
-                tracing::error!(error = %error, job_id = %job_id, "could not persist configured BMC inventory");
-            } else {
+            );
+            if let Ok(identity) = stored {
                 let password = if result.password_transitioned {
                     &credentials_for_rotation.new_password
                 } else {
                     &credentials_for_rotation.current_password
                 };
                 if let Err(error) = state.inventory.save_device_credential(
-                    &managed_identity_for_candidate(&candidate),
+                    &identity,
                     &credentials_for_rotation.username,
                     password,
                     &state.device_credential_key,
@@ -961,6 +961,8 @@ async fn run_job(
                     )
                     .await;
                 }
+            } else if let Err(error) = stored {
+                tracing::error!(error = %error, job_id = %job_id, "could not persist configured BMC inventory");
             }
             append_job_log(&state, job_id, "配置完成").await;
             update_job(&state, job_id, JobState::Completed, Some(result), None).await;
@@ -983,13 +985,6 @@ async fn run_job(
             update_job(&state, job_id, JobState::Failed, None, Some(safe_error)).await;
         }
     }
-}
-
-fn managed_identity_for_candidate(candidate: &BmcCandidate) -> String {
-    candidate
-        .mac
-        .clone()
-        .unwrap_or_else(|| format!("scope-{}-ip-{}", candidate.scope_id, candidate.ip))
 }
 
 /// Keep a factory-credential profile reusable for other uninitialized BMCs. Once one BMC has
@@ -1361,6 +1356,7 @@ async fn update_managed_bmc(
     Path(identity): Path<String>,
     Json(request): Json<UpdateManagedBmcRequest>,
 ) -> Result<Json<ManagedBmc>, ApiError> {
+    let _edit = state.inventory_edit.lock().await;
     if let Some(credentials) = request.device_credentials.as_ref() {
         validate_device_credential(&credentials.username, &credentials.password)?;
     }
@@ -1369,6 +1365,7 @@ async fn update_managed_bmc(
         .find(&identity)
         .map_err(inventory_api_error)?
         .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    let previous = managed.clone();
     if let Some(current_ip) = request.current_ip {
         managed = state
             .inventory
@@ -1404,6 +1401,7 @@ async fn update_managed_bmc(
             .set_cluster(&identity, cluster_id)
             .map_err(inventory_api_error)?;
     }
+    let credentials_changed = request.device_credentials.is_some();
     if let Some(credentials) = request.device_credentials {
         managed = state
             .inventory
@@ -1421,6 +1419,7 @@ async fn update_managed_bmc(
             .mark_for_reprovision(&identity)
             .map_err(inventory_api_error)?;
     }
+    monitoring::invalidate(&state, &previous, &managed, credentials_changed).await;
     Ok(Json(managed))
 }
 
@@ -1429,6 +1428,7 @@ async fn delete_managed_bmc(
     State(state): State<Arc<AppState>>,
     Path(identity): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    let _edit = state.inventory_edit.lock().await;
     state
         .inventory
         .delete(&identity)
@@ -1949,129 +1949,9 @@ async fn check_managed_bmc(
 async fn managed_power_status(
     State(state): State<Arc<AppState>>,
     Path(identity): Path<String>,
-    Json(_request): Json<ManagedPowerStatusRequest>,
+    Json(request): Json<ManagedPowerStatusRequest>,
 ) -> Result<Json<ManagedPowerStatusResponse>, ApiError> {
-    let mut managed = state
-        .inventory
-        .find(&identity)
-        .map_err(inventory_api_error)?
-        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
-    let fingerprint = match probe_certificate(managed.current_ip).await {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => {
-            tracing::warn!(error = %error, ip = %managed.current_ip, "BMC HTTPS status probe failed");
-            let managed = state
-                .inventory
-                .record_health(
-                    &identity,
-                    "offline",
-                    "unreachable",
-                    "unknown",
-                    Some("HTTPS connection failed"),
-                )
-                .map_err(inventory_api_error)?;
-            return Ok(Json(ManagedPowerStatusResponse {
-                managed,
-                power: None,
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: Some("BMC HTTPS is unreachable".to_owned()),
-            }));
-        }
-    };
-
-    if managed.certificate_fingerprint.is_none() {
-        managed = state
-            .inventory
-            .set_certificate_fingerprint(&identity, &fingerprint.sha256)
-            .map_err(inventory_api_error)?;
-    }
-
-    let credentials = credentials_for_managed_bmc(state.as_ref(), &managed).await?;
-    let client = RedfishClient::for_ipv4_with_fingerprint(
-        managed.current_ip,
-        &credentials,
-        managed.certificate_fingerprint.as_deref(),
-    )
-    .map_err(workflow_redfish_api_error)?;
-    match client.power_status().await {
-        Ok(power) => {
-            let managed = state
-                .inventory
-                .record_health(&identity, "online", "reachable", "success", None)
-                .map_err(inventory_api_error)?;
-            // Redfish authenticated and returned a ComputerSystem, yet advertised no ResetType
-            // this tool is willing to send. Say so, otherwise the disabled power buttons are
-            // indistinguishable from a BMC that was never probed.
-            let detail = power.supported_actions.is_empty().then(|| {
-                "Redfish is reachable but this BMC advertised no usable ResetType; power buttons stay disabled"
-                    .to_owned()
-            });
-            Ok(Json(ManagedPowerStatusResponse {
-                managed,
-                power: Some(power),
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail,
-            }))
-        }
-        Err(bmc_provisioner::redfish::RedfishError::AuthenticationFailed) => {
-            let managed = state
-                .inventory
-                .record_health(
-                    &identity,
-                    "online",
-                    "reachable",
-                    "failed",
-                    Some("Redfish authentication failed"),
-                )
-                .map_err(inventory_api_error)?;
-            Ok(Json(ManagedPowerStatusResponse {
-                managed,
-                power: None,
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: Some("Redfish credential authentication failed".to_owned()),
-            }))
-        }
-        Err(bmc_provisioner::redfish::RedfishError::NoComputerSystem)
-        | Err(bmc_provisioner::redfish::RedfishError::NoPowerResetAction) => {
-            let managed = state
-                .inventory
-                .record_health(&identity, "online", "reachable", "success", None)
-                .map_err(inventory_api_error)?;
-            Ok(Json(ManagedPowerStatusResponse {
-                managed,
-                power: None,
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: Some(
-                    "Redfish is available but this BMC does not expose a standard power action"
-                        .to_owned(),
-                ),
-            }))
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, ip = %managed.current_ip, "could not read Redfish power status");
-            let managed = state
-                .inventory
-                .record_health(
-                    &identity,
-                    "online",
-                    "unreachable",
-                    "unknown",
-                    Some("Redfish power status could not be read"),
-                )
-                .map_err(inventory_api_error)?;
-            Ok(Json(ManagedPowerStatusResponse {
-                managed,
-                power: None,
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: Some("BMC Redfish did not return a usable power status".to_owned()),
-            }))
-        }
-    }
+    monitoring::recheck_power(&state, &identity, request.expected_ip).await.map(Json)
 }
 
 fn current_timestamp_seconds() -> i64 {
@@ -2126,130 +2006,6 @@ async fn managed_telemetry_history(
 
 /// Collects a compact hardware summary for one managed BMC. The local controller pins a
 /// self-signed certificate on first contact and continues collection automatically.
-async fn managed_telemetry(
-    State(state): State<Arc<AppState>>,
-    Path(identity): Path<String>,
-    Json(_request): Json<ManagedTelemetryRequest>,
-) -> Result<Json<ManagedTelemetryResponse>, ApiError> {
-    let mut managed = state
-        .inventory
-        .find(&identity)
-        .map_err(inventory_api_error)?
-        .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
-    let fingerprint = match probe_certificate(managed.current_ip).await {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => {
-            tracing::warn!(error = %error, ip = %managed.current_ip, "BMC telemetry HTTPS probe failed");
-            let managed = state
-                .inventory
-                .record_health(
-                    &identity,
-                    "offline",
-                    "unreachable",
-                    "unknown",
-                    Some("HTTPS connection failed during telemetry collection"),
-                )
-                .map_err(inventory_api_error)?;
-            return Ok(Json(ManagedTelemetryResponse {
-                managed,
-                telemetry: None,
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: Some("BMC HTTPS is unreachable".to_owned()),
-            }));
-        }
-    };
-    if managed.certificate_fingerprint.is_none() {
-        managed = state
-            .inventory
-            .set_certificate_fingerprint(&identity, &fingerprint.sha256)
-            .map_err(inventory_api_error)?;
-    }
-
-    let credentials = credentials_for_managed_bmc(state.as_ref(), &managed).await?;
-    let client = RedfishClient::for_ipv4_with_fingerprint(
-        managed.current_ip,
-        &credentials,
-        managed.certificate_fingerprint.as_deref(),
-    )
-    .map_err(workflow_redfish_api_error)?;
-    match client
-        .telemetry_with_model_hint(managed.hardware_model.as_deref())
-        .await
-    {
-        Ok(telemetry) => {
-            state
-                .inventory
-                .record_hardware_identity(
-                    &identity,
-                    managed.current_ip,
-                    telemetry.bmc_mac.as_deref(),
-                    telemetry.serial_number.as_deref(),
-                    telemetry.model.as_deref(),
-                )
-                .map_err(inventory_api_error)?;
-            state
-                .inventory
-                .record_telemetry(
-                    &identity,
-                    telemetry.power_watts,
-                    telemetry.temperature_celsius,
-                )
-                .map_err(inventory_api_error)?;
-            let managed = state
-                .inventory
-                .record_health(&identity, "online", "reachable", "success", None)
-                .map_err(inventory_api_error)?;
-            Ok(Json(ManagedTelemetryResponse {
-                managed,
-                telemetry: Some(telemetry),
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: None,
-            }))
-        }
-        Err(bmc_provisioner::redfish::RedfishError::AuthenticationFailed) => {
-            let managed = state
-                .inventory
-                .record_health(
-                    &identity,
-                    "online",
-                    "reachable",
-                    "failed",
-                    Some("Redfish authentication failed during telemetry collection"),
-                )
-                .map_err(inventory_api_error)?;
-            Ok(Json(ManagedTelemetryResponse {
-                managed,
-                telemetry: None,
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: Some("Redfish credential authentication failed".to_owned()),
-            }))
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, ip = %managed.current_ip, "could not collect BMC telemetry");
-            let managed = state
-                .inventory
-                .record_health(
-                    &identity,
-                    "online",
-                    "reachable",
-                    "unknown",
-                    Some("Redfish telemetry collection failed"),
-                )
-                .map_err(inventory_api_error)?;
-            Ok(Json(ManagedTelemetryResponse {
-                managed,
-                telemetry: None,
-                certificate_fingerprint: None,
-                certificate_trust_required: false,
-                detail: Some("BMC did not provide a usable standard telemetry summary".to_owned()),
-            }))
-        }
-    }
-}
-
 /// Executes only a capability-advertised standard ComputerSystem.Reset action. The controller's
 /// own allowable ResetType list selects the exact vendor-compatible spelling.
 async fn managed_power_command(
@@ -2262,6 +2018,12 @@ async fn managed_power_command(
         .find(&identity)
         .map_err(inventory_api_error)?
         .ok_or_else(|| ApiError::not_found("managed BMC was not found"))?;
+    if request.expected_ip.is_some_and(|ip| ip != managed.current_ip) {
+        return Err(ApiError::conflict("BMC 地址已变化，请重新确认操作目标"));
+    }
+    if managed.configuration_status == "draft" {
+        return Err(ApiError::conflict("请先确认复制条目的 BMC 地址"));
+    }
     let fingerprint = managed
         .certificate_fingerprint
         .as_deref()
@@ -2294,6 +2056,16 @@ async fn managed_power_command(
                 .map_err(inventory_api_error)?;
             Err(ApiError::unprocessable("BMC Redfish authentication failed"))
         }
+        Err(bmc_provisioner::redfish::RedfishError::ResourceAccess { status, path }) => {
+            let (auth, message) = if status == StatusCode::FORBIDDEN {
+                ("forbidden", "当前账号无权访问该资源（HTTP 403）")
+            } else {
+                ("failed", "Redfish 需要重新认证（HTTP 401）")
+            };
+            state.inventory.record_health(&identity, "online", "reachable", auth, Some(&format!("{message} · {path}")))
+                .map_err(inventory_api_error)?;
+            Err(ApiError::unprocessable_with_details(message, serde_json::json!({ "path": path })))
+        }
         Err(bmc_provisioner::redfish::RedfishError::UnsupportedPowerAction(_))
         | Err(bmc_provisioner::redfish::RedfishError::NoComputerSystem)
         | Err(bmc_provisioner::redfish::RedfishError::NoPowerResetAction) => Err(
@@ -2311,8 +2083,15 @@ async fn managed_power_command(
                     Some("Redfish connection failed during power operation"),
                 )
                 .map_err(inventory_api_error)?;
-            Err(ApiError::unprocessable(
-                "could not reach BMC Redfish for the power operation",
+            Err(ApiError::unprocessable_with_details(
+                "BMC Redfish 连接中断，电源指令送达状态未知",
+                serde_json::json!({ "deliveryUnknown": true }),
+            ))
+        }
+        Err(bmc_provisioner::redfish::RedfishError::UnexpectedStatus { status, .. }) if status.is_server_error() => {
+            Err(ApiError::unprocessable_with_details(
+                "BMC Redfish 返回服务错误，电源指令送达状态未知",
+                serde_json::json!({ "deliveryUnknown": true }),
             ))
         }
         Err(error) => {
@@ -2388,6 +2167,14 @@ fn workflow_redfish_api_error(error: bmc_provisioner::redfish::RedfishError) -> 
 }
 
 fn inventory_api_error(error: bmc_provisioner::storage::StoreError) -> ApiError {
+    use bmc_provisioner::storage::StoreError;
+    if let StoreError::DeviceConflict { identity, name, address, cluster } = error {
+        return ApiError {
+            status: StatusCode::CONFLICT,
+            message: "已有设备使用此 BMC IP 或 MAC",
+            details: Some(serde_json::json!({ "identity": identity, "name": name, "address": address, "cluster": cluster })),
+        };
+    }
     if matches!(error, bmc_provisioner::storage::StoreError::MissingRecord) {
         return ApiError::not_found("managed BMC was not found");
     }
